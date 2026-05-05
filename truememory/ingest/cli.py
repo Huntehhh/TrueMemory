@@ -344,8 +344,8 @@ def _run_setup(args):
             print(f"  \033[32m✓ {tier.capitalize()} dependencies already installed\033[0m")
         except ImportError:
             print(f'  \033[33m⚠ {tier.capitalize()} tier requires GPU extras.\033[0m')
-            print(f'  \033[33m  curl installer: uv tool install "truememory[gpu]"\033[0m')
-            print(f'  \033[33m  pip:            pip install "truememory[gpu]"\033[0m')
+            print('  \033[33m  curl installer: uv tool install "truememory[gpu]"\033[0m')
+            print('  \033[33m  pip:            pip install "truememory[gpu]"\033[0m')
             if not args.non_interactive:
                 do_install = input("  Install now? [y/N]: ").strip().lower()
                 if do_install == "y":
