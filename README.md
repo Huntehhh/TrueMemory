@@ -48,11 +48,13 @@ One command. Works on any Mac or Linux box, even if your system Python is old or
 curl -LsSf https://raw.githubusercontent.com/buildingjoshbetter/TrueMemory/main/install.sh | sh
 ```
 
-**Step 3.** Wait ~3-5 minutes while it downloads and installs. The installer pre-downloads models for all three tiers (Edge, Base, Pro) so you can switch between them instantly later.
+**Step 3.** Wait ~3-5 minutes while it downloads and installs (up to 15-30 minutes on slower connections). The installer pre-downloads models for all three tiers (Edge, Base, Pro) so you can switch between them instantly later.
 
 **Step 4.** If Claude Desktop was already open, **quit it with `Cmd+Q` and reopen it** (a new chat window is not enough; the config is only read at launch). Then start a new Claude session and type **"Set up TrueMemory"**. TrueMemory walks you through choosing **Edge**, **Base**, or **Pro**.
 
-> **Switching tiers later?** Just tell Claude "switch to Base" or "switch to Pro" in any session. All models are pre-installed, so switching is instant. Pro requires an LLM API key for HyDE query expansion.
+> **Switching tiers later?** Just tell Claude "switch to Base" or "switch to Pro" in any session. All models are pre-installed, so switching is instant (if you have existing memories, they will be re-embedded with the new model, which may take a moment). Pro requires an LLM API key for HyDE query expansion.
+
+> **Updating to the latest version?** Run `uv tool upgrade truememory` in your terminal. Then restart Claude.
 
 > **What this actually does:** installs [uv](https://docs.astral.sh/uv/) (Astral's Python tool manager) if needed, fetches a managed Python 3.12 into `~/.local/share/uv/`, installs TrueMemory with all tier models into an isolated tool environment, registers the MCP server, wires up lifecycle hooks, and merges instructions into your `~/.claude/CLAUDE.md`. **Your system Python is never touched.** No sudo, no venvs, no pip struggle. Uninstall cleanly with `uv tool uninstall truememory`.
 
