@@ -111,7 +111,7 @@ main() {
   say "installing $PKG_SPEC (~1-2 min on first run)..."
   # --force makes re-runs idempotent. --python pins the interpreter to avoid
   # astral-sh/uv#14110. stderr stays visible so you see real progress and errors.
-  uv tool install --python "$TRUEMEMORY_PY" --force "$PKG_SPEC" >/dev/null || \
+  uv tool install --python "$TRUEMEMORY_PY" --force --refresh "$PKG_SPEC" >/dev/null || \
     die "truememory install failed (see error above)"
 
   # Future shells should see ~/.local/bin. Reversible via 'uv tool update-shell --uninstall'.
