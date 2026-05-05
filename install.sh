@@ -17,7 +17,7 @@
 #
 # Environment overrides:
 #   TRUEMEMORY_PY=3.12         # pin a specific Python (default: 3.12)
-#   TRUEMEMORY_EXTRAS=          # pip extras (default: none; use "gpu" for Pro/GPU support)
+#   TRUEMEMORY_EXTRAS=          # (deprecated — gpu extras are now installed by default)
 #   TRUEMEMORY_SOURCE=...      # install from a local path or git URL instead of PyPI
 #                            # (useful for testing: TRUEMEMORY_SOURCE=/path/to/truememory)
 #   TRUEMEMORY_SKIP_SETUP=1    # skip the Claude auto-config step
@@ -61,18 +61,10 @@ main() {
   esac
 
   if [ -n "$TRUEMEMORY_SOURCE" ]; then
-    if [ -n "$TRUEMEMORY_EXTRAS" ]; then
-      PKG_SPEC="${TRUEMEMORY_SOURCE}[${TRUEMEMORY_EXTRAS}]"
-    else
-      PKG_SPEC="$TRUEMEMORY_SOURCE"
-    fi
+    PKG_SPEC="${TRUEMEMORY_SOURCE}[gpu]"
     say "using custom source: $TRUEMEMORY_SOURCE"
   else
-    if [ -n "$TRUEMEMORY_EXTRAS" ]; then
-      PKG_SPEC="truememory[${TRUEMEMORY_EXTRAS}]"
-    else
-      PKG_SPEC="truememory"
-    fi
+    PKG_SPEC="truememory[gpu]"
   fi
 
   # ---------- preflight ----------
@@ -108,7 +100,7 @@ main() {
     die "failed to install managed Python $TRUEMEMORY_PY (see error above)"
 
   # ---------- step 3: install truememory as a uv tool ----------
-  say "installing $PKG_SPEC (~1-2 min on first run)..."
+  say "installing $PKG_SPEC (~3-5 min on first run, downloads all tier models)..."
   # --force makes re-runs idempotent. --python pins the interpreter to avoid
   # astral-sh/uv#14110. stderr stays visible so you see real progress and errors.
   uv tool install --python "$TRUEMEMORY_PY" --force --refresh "$PKG_SPEC" >/dev/null || \
@@ -131,6 +123,35 @@ main() {
     say "installing hooks and CLAUDE.md instructions..."
     truememory-ingest install || \
       warn "hook install returned non-zero (you can re-run it with: truememory-ingest install)"
+  fi
+
+  # ---------- step 5: pre-download models for all tiers ----------
+  say "pre-downloading models for all tiers (Edge + Base + Pro)..."
+  say "  this takes 2-5 min but means tier switching just works afterward."
+  # Use the tool's Python to run the download inside the uv venv
+  TOOL_PYTHON="$(uv tool dir)/truememory/bin/python"
+  if [ -x "$TOOL_PYTHON" ]; then
+    # Edge: Model2Vec embedder (usually bundled) + MiniLM reranker
+    "$TOOL_PYTHON" -c "
+from sentence_transformers import CrossEncoder
+print('  downloading Edge reranker (MiniLM-L-6-v2)...')
+CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+print('  ✓ Edge reranker cached')
+" 2>/dev/null && ok "Edge models ready" || warn "Edge reranker download failed (search still works without it)"
+
+    # Base/Pro: Qwen3 embedder + gte-reranker
+    "$TOOL_PYTHON" -c "
+from sentence_transformers import SentenceTransformer, CrossEncoder
+print('  downloading Base/Pro embedder (Qwen3-Embedding-0.6B, ~1.2GB)...')
+SentenceTransformer('Qwen/Qwen3-Embedding-0.6B', truncate_dim=256)
+print('  ✓ embedder cached')
+print('  downloading Base/Pro reranker (gte-reranker-modernbert-base, ~600MB)...')
+CrossEncoder('Alibaba-NLP/gte-reranker-modernbert-base')
+print('  ✓ reranker cached')
+" 2>/dev/null && ok "Base/Pro models ready" || warn "Base/Pro model download failed (you can retry later or use Edge tier)"
+  else
+    warn "could not locate tool Python at $TOOL_PYTHON — skipping model pre-download"
+    warn "models will download on first use instead"
   fi
 
   # ---------- done ----------
