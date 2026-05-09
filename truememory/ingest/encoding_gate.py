@@ -156,6 +156,10 @@ class EncodingGate:
         salience_floor: float | None = None,
         user_id: str = "",
     ):
+        if not (0.0 <= threshold <= 1.0):
+            raise ValueError(
+                f"gate_threshold must be in [0.0, 1.0], got {threshold}"
+            )
         self.memory = memory
         self.threshold = threshold
         if w_novelty is None:
