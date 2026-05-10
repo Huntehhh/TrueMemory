@@ -20,7 +20,7 @@ Store a memory. Claude calls this proactively when the user shares preferences, 
 
 ## truememory_search
 
-Search memories using the full agentic retrieval pipeline (HyDE, cross-encoder reranking, multi-round retrieval).
+Search memories using the full agentic retrieval pipeline (cross-encoder reranking, multi-round retrieval, and HyDE query expansion when an API key is configured).
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|

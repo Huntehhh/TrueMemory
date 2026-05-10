@@ -23,7 +23,12 @@ The installer handles everything: uv, Python 3.12, TrueMemory, MCP server regist
 
 ## How it works
 
-Every time you close a Claude session, TrueMemory:
+TrueMemory captures memories at three points:
+- **Session end** — when you close a Claude session, the full conversation is processed
+- **Every 4 hours** — long-running sessions trigger incremental extraction automatically
+- **Before context compression** — when Claude is about to compress its context, TrueMemory captures memories before they're lost
+
+The extraction pipeline:
 1. Reads the conversation transcript
 2. Extracts atomic facts (preferences, decisions, corrections)
 3. Filters through the encoding gate (novelty + salience + prediction error)
@@ -76,3 +81,17 @@ print(results[0]["content"])
 ```
 
 See [Python API Reference](../python-api.md) for full details.
+
+## Telemetry
+
+TrueMemory collects anonymous usage telemetry (tool calls, session counts, platform info). No memory content, queries, or API keys are ever sent. To opt out:
+
+```bash
+export TRUEMEMORY_TELEMETRY=off
+```
+
+See the [Environment Variables](../env-vars.md) reference for details.
+
+## Contributing
+
+Want to contribute? See [CONTRIBUTING.md](../../CONTRIBUTING.md) for the development setup, branching conventions, and our code review process.

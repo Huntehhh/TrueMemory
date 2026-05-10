@@ -67,6 +67,6 @@ All TrueMemory environment variables and their defaults.
 
 | Variable | Description |
 |----------|-------------|
-| `ANTHROPIC_API_KEY` | Anthropic API key for HyDE (Pro tier) |
-| `OPENROUTER_API_KEY` | OpenRouter API key for HyDE |
-| `OPENAI_API_KEY` | OpenAI API key for HyDE |
+| `ANTHROPIC_API_KEY` | Anthropic API key for HyDE query expansion and LLM-based fact extraction |
+| `OPENROUTER_API_KEY` | OpenRouter API key for HyDE and fact extraction |
+| `OPENAI_API_KEY` | OpenAI API key for HyDE and fact extraction |

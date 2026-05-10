@@ -40,8 +40,9 @@ truememory-ingest facts --category personal
 ### "truememory is not installed"
 
 You're running the command from a shell that doesn't have the uv tool directory on PATH. Either:
-- Open a new terminal window
-- Or run: `export PATH="$HOME/.local/bin:$PATH"`
+- Open a new terminal window (Mac/Linux/Windows)
+- Mac/Linux: `export PATH="$HOME/.local/bin:$PATH"`
+- Windows PowerShell: close and reopen PowerShell, or run `$env:Path = [System.Environment]::GetEnvironmentVariable("Path", "User") + ";" + $env:Path`
 
 ### Memories not being stored
 
