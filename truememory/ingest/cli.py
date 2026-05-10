@@ -293,7 +293,7 @@ def _load_truememory_config() -> dict:
     """Load persistent config from ~/.truememory/config.json."""
     if _TRUEMEMORY_CONFIG_PATH.exists():
         try:
-            return json.loads(_TRUEMEMORY_CONFIG_PATH.read_text())
+            return json.loads(_TRUEMEMORY_CONFIG_PATH.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             return {}
     return {}
@@ -309,7 +309,7 @@ def _save_truememory_config(config: dict) -> None:
     """
     _TRUEMEMORY_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     _TRUEMEMORY_CONFIG_PATH.parent.chmod(0o700)
-    _TRUEMEMORY_CONFIG_PATH.write_text(json.dumps(config, indent=2))
+    _TRUEMEMORY_CONFIG_PATH.write_text(json.dumps(config, indent=2), encoding="utf-8")
     _TRUEMEMORY_CONFIG_PATH.chmod(0o600)
     if sys.platform == "win32" and any(k.endswith("_api_key") for k in config):
         print(
