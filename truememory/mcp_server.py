@@ -1228,8 +1228,38 @@ def main():
     # load in background threads (~2.5s) while the MCP handshake
     # completes (~1-3s), so the first search arrives with warm models.
     _preload_models()
-    mcp.run(transport="stdio")
-    return 0
+
+    # Hunter F41: bypass Python interpreter teardown via os._exit(0).
+    #
+    # On Windows, when the MCP client (Claude Code) closes the stdio pipe,
+    # mcp.run() returns and Python begins normal shutdown — atexit handlers,
+    # threading._shutdown(), gc, etc. PyTorch (loaded by sentence-transformers
+    # in our daemon preload threads) holds OpenMP thread pools and memory-
+    # mapped weight files that don't release cleanly during this teardown
+    # phase, causing the process to hang indefinitely. The result: every
+    # /mcp toggle in Claude Code spawns a new subprocess WITHOUT killing
+    # the old one, leaking ~450 MB of resident RAM per zombie.
+    #
+    # Wrapping mcp.run() in try/finally and force-exiting via os._exit(0)
+    # bypasses Python's teardown entirely. SQLite WAL is checkpoint-safe
+    # under sudden termination (this is what SQLite is designed for), so
+    # no DB consistency is lost. We also explicitly close the global
+    # _memory connection before the hard exit as a courtesy — it's not
+    # required for correctness (OS reclaims the FD), but it lets the WAL
+    # checkpoint flush cleanly so the next process starts faster.
+    try:
+        mcp.run(transport="stdio")
+    except (BrokenPipeError, EOFError, KeyboardInterrupt):
+        pass  # Normal disconnect paths — fall through to cleanup + exit.
+    finally:
+        global _memory
+        if _memory is not None:
+            try:
+                _memory._engine.conn.close()
+            except Exception:
+                pass
+        os._exit(0)
+    return 0  # Unreachable — kept for type-checker happiness.
 
 
 if __name__ == "__main__":
