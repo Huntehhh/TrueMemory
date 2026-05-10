@@ -418,7 +418,7 @@ def _set_reranker(model_name: str):
         _clear_reranker_error()
     except ImportError as e:
         _record_reranker_error(
-            f"ImportError: {e} — install truememory[gpu] for reranker support"
+            f"ImportError: {e} — reinstall truememory to restore reranker support"
         )
     except Exception as e:
         _record_reranker_error(f"{type(e).__name__}: {e}")
@@ -658,12 +658,12 @@ def truememory_stats() -> str:
             "\n"
             "**Choose your tier:**\n"
             "\n"
-            "- **Edge** — 89.6% accuracy on LoCoMo. CPU-only, works anywhere. "
-            "Lightweight (~30MB). No API key needed.\n"
-            "- **Base** — 92.0% accuracy on LoCoMo. GPU recommended. "
-            "Qwen3 @ 256d + gte-reranker (~1.5GB). No API key needed.\n"
-            "- **Pro** — 93.0% accuracy on LoCoMo. GPU recommended. "
-            "Same as Base plus HyDE query expansion. Requires an API key.\n"
+            "- **Edge** — 89.6% accuracy on LoCoMo. Lightweight, works anywhere. "
+            "No API key needed.\n"
+            "- **Base** — 92.0% accuracy on LoCoMo. Higher accuracy with "
+            "Qwen3 embeddings + gte-reranker. No API key needed.\n"
+            "- **Pro** — 93.0% accuracy on LoCoMo. Maximum accuracy — "
+            "same as Base plus HyDE query expansion. Requires an API key.\n"
             "\n"
             "Which would you like: **Edge**, **Base**, or **Pro**?"
         )
@@ -710,20 +710,6 @@ def truememory_configure(
         if api_provider not in ("anthropic", "openrouter", "openai"):
             return json.dumps({
                 "error": "api_provider must be one of: anthropic, openrouter, openai",
-            })
-
-    # Check Base / Pro dependencies before committing (both need sentence-transformers
-    # for the Qwen3 embedder + gte-reranker).
-    if tier in ("base", "pro"):
-        try:
-            import sentence_transformers  # noqa: F401
-        except ImportError:
-            return json.dumps({
-                "error": f"{tier.capitalize()} tier requires GPU extras. "
-                         f"If you installed via the curl installer, run:  uv tool install \"truememory[gpu]\"  "
-                         f"If you used pip, run:  pip install \"truememory[gpu]\"  "
-                         f"Then restart Claude and try again.",
-                "current_tier": _load_config().get("tier", "edge"),
             })
 
     # Save to persistent config
@@ -811,9 +797,9 @@ def truememory_configure(
 
     # Build result with onboarding info
     _tier_descriptions = {
-        "edge": "Edge: Model2Vec embeddings (8M params), MiniLM reranker (~30MB)",
-        "base": "Base: Qwen3 embeddings (256d), gte-reranker-modernbert (~1.5GB)",
-        "pro": "Pro: Qwen3 + HyDE query expansion (~1.5GB + API key)",
+        "edge": "Edge: Model2Vec embeddings (8M params), MiniLM reranker",
+        "base": "Base: Qwen3 embeddings (256d), gte-reranker-modernbert",
+        "pro": "Pro: Qwen3 + HyDE query expansion",
     }
     result = {
         "status": "configured",
