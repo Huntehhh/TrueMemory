@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.6] — 2026-05-10
+
+### Fixed
+- **Telemetry email persistence** — `session_start` now includes the email from
+  `config.json` on every session, so the dashboard always has it. Previously
+  email was only sent during initial onboarding. (#211)
+
 ## [0.6.5] — 2026-05-10
 
 ### Added
