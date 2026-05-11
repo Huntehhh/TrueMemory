@@ -1255,13 +1255,10 @@ def main():
     os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
     # Initialize telemetry (fire-and-forget, opt-out via TRUEMEMORY_TELEMETRY=off)
-    # Also checks for version updates — stores result for session_start hook
+    # Update check now runs in background thread inside telemetry.init()
     try:
         from truememory import telemetry
-        update_info = telemetry.init(_load_config())
-        if update_info and update_info.get("update_available"):
-            _update_check_path = Path.home() / ".truememory" / ".update_available"
-            _update_check_path.write_text(json.dumps(update_info), encoding="utf-8")
+        telemetry.init(_load_config())
     except Exception:
         pass
 
