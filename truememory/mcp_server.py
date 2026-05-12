@@ -27,10 +27,14 @@ import json
 import logging
 import os
 import re
-import resource
 import sys
 import threading
 import time
+
+try:
+    import resource as _resource_mod
+except ImportError:
+    _resource_mod = None
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -585,6 +589,8 @@ def truememory_search(
     llm_fn = _get_llm_fn()
     uid = user_id or None
     queries = [q.strip() for q in query.split("|") if q.strip()]
+    if not queries:
+        return json.dumps([])
 
     if len(queries) == 1:
         m = _get_memory()
@@ -628,6 +634,8 @@ def truememory_search_deep(
     llm_fn = _get_llm_fn()
     uid = user_id or None
     queries = [q.strip() for q in query.split("|") if q.strip()]
+    if not queries:
+        return json.dumps([])
 
     if len(queries) == 1:
         m = _get_memory()
@@ -967,7 +975,9 @@ _idle_timer_lock = threading.Lock()
 
 
 def _get_rss_mb() -> float:
-    ru = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    if _resource_mod is None:
+        return 0.0
+    ru = _resource_mod.getrusage(_resource_mod.RUSAGE_SELF).ru_maxrss
     if sys.platform == "darwin":
         return ru / (1024 * 1024)
     return ru / 1024
