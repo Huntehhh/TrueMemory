@@ -116,16 +116,20 @@ def test_drain_backlog_respects_spawn_cap(tmp_path, monkeypatch):
             yield True
 
     monkeypatch.setattr(core_mod, "spawn_gate", _counting_gate)
+    monkeypatch.setattr(core_mod, "register_spawned_pid", lambda pid: None)
 
-    popen_calls = []
+    ingest_calls = []
     def _mock_popen(*args, **kwargs):
-        popen_calls.append(args)
-        return type("P", (), {"pid": 0, "__enter__": lambda s: s, "__exit__": lambda *a: None})()
+        cmd = args[0] if args else kwargs.get("args", [])
+        result = type("P", (), {"pid": 99999, "__enter__": lambda s: s, "__exit__": lambda *a: None, "stdout": ""})()
+        if isinstance(cmd, list) and "truememory.ingest.cli" in " ".join(str(c) for c in cmd):
+            ingest_calls.append(args)
+        return result
 
     monkeypatch.setattr(subprocess, "Popen", _mock_popen)
 
     ss_mod._drain_backlog()
 
-    assert len(popen_calls) == 2, f"Expected exactly 2 spawns, got {len(popen_calls)}"
+    assert len(ingest_calls) == 2, f"Expected exactly 2 ingest spawns, got {len(ingest_calls)}"
     remaining = list(backlog.glob("*.json"))
     assert len(remaining) == 3, f"Expected 3 remaining backlog items, got {len(remaining)}"

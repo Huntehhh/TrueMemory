@@ -1075,6 +1075,7 @@ def _backlog_drainer() -> None:
 
     while True:
         try:
+            _reap_children()
             if _BACKLOG_DIR.exists():
                 markers = sorted(_BACKLOG_DIR.glob("*.json"))
                 if markers:
@@ -1082,6 +1083,22 @@ def _backlog_drainer() -> None:
         except Exception:
             pass
         _time.sleep(_BACKLOG_DRAIN_INTERVAL)
+
+
+def _reap_children() -> None:
+    """Reap any zombie child processes spawned by this MCP server.
+
+    Without this, Popen'd ingest processes become <defunct> zombies after
+    they finish, and os.kill(pid, 0) / ps still sees them as alive —
+    permanently blocking spawn gate slots.
+    """
+    try:
+        while True:
+            pid, _ = os.waitpid(-1, os.WNOHANG)
+            if pid == 0:
+                break
+    except ChildProcessError:
+        pass
 
 
 def _drain_one_from_backlog(markers: list[Path]) -> None:
