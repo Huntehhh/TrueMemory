@@ -47,14 +47,24 @@ except ImportError:
 
 
 def _pid_is_alive(pid: int) -> bool:
-    """Check if a PID is still running."""
+    """Check if a PID is a live (non-zombie) truememory ingest process."""
     if pid <= 0:
         return False
     try:
-        os.kill(pid, 0)
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "state="],
+            capture_output=True, text=True, timeout=2,
+        )
+        state = (result.stdout or "").strip()
+        if not state or state.startswith("Z"):
+            return False
         return True
-    except (OSError, ProcessLookupError):
-        return False
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        try:
+            os.kill(pid, 0)
+            return True
+        except (OSError, ProcessLookupError):
+            return False
 
 
 def _read_live_pids() -> list[int]:
