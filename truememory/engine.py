@@ -26,6 +26,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import threading
 import time
 import sqlite3
 from pathlib import Path
@@ -282,6 +283,7 @@ class TrueMemoryEngine:
         self.conn: sqlite3.Connection | None = None
         self.ready = False
         self.stats: dict = {}
+        self._write_lock = threading.Lock()
 
         # L5 surprise rerank boost coefficient. None = resolve from env
         # var / default at call-time via _get_alpha_surprise().
@@ -410,43 +412,47 @@ class TrueMemoryEngine:
         Returns:
             Dict with ``id`` and the stored fields.
         """
+        if not isinstance(content, str):
+            raise TypeError(f"content must be a string, got {type(content).__name__}")
+
         self._ensure_connection()
 
-        msg = {
-            "content": content,
-            "sender": sender,
-            "recipient": recipient,
-            "timestamp": timestamp,
-            "category": category,
-            "modality": "",
-        }
-        new_id = insert_message(self.conn, msg)
+        with self._write_lock:
+            msg = {
+                "content": content,
+                "sender": sender,
+                "recipient": recipient,
+                "timestamp": timestamp,
+                "category": category,
+                "modality": "",
+            }
+            new_id = insert_message(self.conn, msg)
 
-        # Embed the message for vector search
-        if self._has_vectors:
-            try:
-                from truememory.vector_search import embed_single
-                embed_single(self.conn, new_id, content)
-            except Exception:
-                logger.debug("Failed to embed message %s during add()", new_id, exc_info=True)
+            # Embed the message for vector search
+            if self._has_vectors:
+                try:
+                    from truememory.vector_search import embed_single
+                    embed_single(self.conn, new_id, content)
+                except Exception:
+                    logger.debug("Failed to embed message %s during add()", new_id, exc_info=True)
 
-        # Incrementally update entity profile
-        if self._has_personality and sender:
-            try:
-                from truememory.personality import update_entity_profile_incremental
-                update_entity_profile_incremental(self.conn, sender, content, recipient)
-            except Exception:
-                logger.debug("Failed to update entity profile for %s during add()", sender, exc_info=True)
+            # Incrementally update entity profile
+            if self._has_personality and sender:
+                try:
+                    from truememory.personality import update_entity_profile_incremental
+                    update_entity_profile_incremental(self.conn, sender, content, recipient)
+                except Exception:
+                    logger.debug("Failed to update entity profile for %s during add()", sender, exc_info=True)
 
-        # Incrementally update style vector (L0 char-n-gram)
-        if self._has_style_vec and sender:
-            try:
-                _update_style_vec(self.conn, sender, content)
-            except Exception:
-                logger.debug("Failed to update style vector for %s during add()", sender, exc_info=True)
+            # Incrementally update style vector (L0 char-n-gram)
+            if self._has_style_vec and sender:
+                try:
+                    _update_style_vec(self.conn, sender, content)
+                except Exception:
+                    logger.debug("Failed to update style vector for %s during add()", sender, exc_info=True)
 
-        # Persist vector embedding and any profile updates
-        self.conn.commit()
+            # Persist vector embedding and any profile updates
+            self.conn.commit()
 
         return {
             "id": new_id,
@@ -463,7 +469,8 @@ class TrueMemoryEngine:
         Returns True if deleted, False if not found.
         """
         self._ensure_connection()
-        return delete_message(self.conn, memory_id)
+        with self._write_lock:
+            return delete_message(self.conn, memory_id)
 
     def delete_all(self, user_id: str | None = None) -> bool:
         """Delete all memories, optionally filtered by user.
@@ -480,145 +487,149 @@ class TrueMemoryEngine:
         Returns:
             True if any rows were deleted from messages.
         """
+        if isinstance(user_id, str) and not user_id.strip():
+            raise ValueError("user_id cannot be an empty string")
+
         self._ensure_connection()
 
-        if user_id:
-            # Get message IDs and episode IDs for this user before deleting
-            msg_ids = [
-                row[0] for row in self.conn.execute(
-                    "SELECT id FROM messages WHERE sender = ?", (user_id,)
-                ).fetchall()
-            ]
-            episode_ids = list({
-                row[0] for row in self.conn.execute(
-                    "SELECT DISTINCT episode_id FROM messages WHERE sender = ? AND episode_id IS NOT NULL",
-                    (user_id,),
-                ).fetchall()
-            })
+        with self._write_lock:
+            if user_id is not None:
+                # Get message IDs and episode IDs for this user before deleting
+                msg_ids = [
+                    row[0] for row in self.conn.execute(
+                        "SELECT id FROM messages WHERE sender = ?", (user_id,)
+                    ).fetchall()
+                ]
+                episode_ids = list({
+                    row[0] for row in self.conn.execute(
+                        "SELECT DISTINCT episode_id FROM messages WHERE sender = ? AND episode_id IS NOT NULL",
+                        (user_id,),
+                    ).fetchall()
+                })
 
-            cursor = self.conn.execute(
-                "DELETE FROM messages WHERE sender = ?", (user_id,)
-            )
-            deleted = cursor.rowcount > 0
-
-            # Clean up related tables scoped to this user
-            if msg_ids:
-                placeholders = ",".join("?" * len(msg_ids))
-
-                for table, col in [
-                    ("fact_timeline", "source_message_id"),
-                    ("landmark_events", "source_message_id"),
-                    ("causal_edges", "cause_msg_id"),
-                    ("causal_edges", "effect_msg_id"),
-                ]:
-                    if table not in _ALLOWED_TABLES:
-                        raise ValueError(f"Invalid table name: {table}")
-                    if col not in _ALLOWED_COLUMNS:
-                        raise ValueError(f"Invalid column name: {col}")
-                    try:
-                        self.conn.execute(
-                            f"DELETE FROM {table} WHERE {col} IN ({placeholders})",
-                            msg_ids,
-                        )
-                    except Exception:
-                        logger.debug("Failed to clean %s for user %s", table, user_id, exc_info=True)
-
-            # Clean entity profile for this user
-            try:
-                self.conn.execute(
-                    "DELETE FROM entity_profiles WHERE entity = ?", (user_id,)
+                cursor = self.conn.execute(
+                    "DELETE FROM messages WHERE sender = ?", (user_id,)
                 )
-            except Exception:
-                logger.debug("Failed to clean entity_profiles for user %s", user_id, exc_info=True)
+                deleted = cursor.rowcount > 0
 
-            # Clean entity style vectors for this user
-            try:
-                self.conn.execute(
-                    "DELETE FROM entity_style_vectors WHERE entity = ?", (user_id,)
-                )
-            except Exception:
-                logger.debug("Failed to clean entity_style_vectors for user %s", user_id, exc_info=True)
+                # Clean up related tables scoped to this user
+                if msg_ids:
+                    placeholders = ",".join("?" * len(msg_ids))
 
-            # Clean entity relationships involving this user
-            try:
-                self.conn.execute(
-                    "DELETE FROM entity_relationships WHERE entity_a = ? OR entity_b = ?",
-                    (user_id, user_id),
-                )
-            except Exception:
-                logger.debug("Failed to clean entity_relationships for user %s", user_id, exc_info=True)
+                    for table, col in [
+                        ("fact_timeline", "source_message_id"),
+                        ("landmark_events", "source_message_id"),
+                        ("causal_edges", "cause_msg_id"),
+                        ("causal_edges", "effect_msg_id"),
+                    ]:
+                        if table not in _ALLOWED_TABLES:
+                            raise ValueError(f"Invalid table name: {table}")
+                        if col not in _ALLOWED_COLUMNS:
+                            raise ValueError(f"Invalid column name: {col}")
+                        try:
+                            self.conn.execute(
+                                f"DELETE FROM {table} WHERE {col} IN ({placeholders})",
+                                msg_ids,
+                            )
+                        except Exception:
+                            logger.warning("Failed to clean %s for user %s", table, user_id, exc_info=True)
 
-            # Clean summaries scoped to this user
-            try:
-                self.conn.execute(
-                    "DELETE FROM summaries WHERE entity = ?", (user_id,)
-                )
-            except Exception:
-                logger.debug("Failed to clean summaries for user %s", user_id, exc_info=True)
-
-            # Clean episodes linked to this user's messages
-            if episode_ids:
-                ep_placeholders = ",".join("?" * len(episode_ids))
+                # Clean entity profile for this user
                 try:
                     self.conn.execute(
-                        f"DELETE FROM episodes WHERE id IN ({ep_placeholders})",
-                        episode_ids,
+                        "DELETE FROM entity_profiles WHERE entity = ?", (user_id,)
                     )
                 except Exception:
-                    logger.debug("Failed to clean episodes for user %s", user_id, exc_info=True)
+                    logger.warning("Failed to clean entity_profiles for user %s", user_id, exc_info=True)
 
-            # Clean vector tables for deleted message IDs
-            if msg_ids:
+                # Clean entity style vectors for this user
+                try:
+                    self.conn.execute(
+                        "DELETE FROM entity_style_vectors WHERE entity = ?", (user_id,)
+                    )
+                except Exception:
+                    logger.warning("Failed to clean entity_style_vectors for user %s", user_id, exc_info=True)
+
+                # Clean entity relationships involving this user
+                try:
+                    self.conn.execute(
+                        "DELETE FROM entity_relationships WHERE entity_a = ? OR entity_b = ?",
+                        (user_id, user_id),
+                    )
+                except Exception:
+                    logger.warning("Failed to clean entity_relationships for user %s", user_id, exc_info=True)
+
+                # Clean summaries scoped to this user
+                try:
+                    self.conn.execute(
+                        "DELETE FROM summaries WHERE entity = ?", (user_id,)
+                    )
+                except Exception:
+                    logger.warning("Failed to clean summaries for user %s", user_id, exc_info=True)
+
+                # Clean episodes linked to this user's messages
+                if episode_ids:
+                    ep_placeholders = ",".join("?" * len(episode_ids))
+                    try:
+                        self.conn.execute(
+                            f"DELETE FROM episodes WHERE id IN ({ep_placeholders})",
+                            episode_ids,
+                        )
+                    except Exception:
+                        logger.warning("Failed to clean episodes for user %s", user_id, exc_info=True)
+
+                # Clean vector tables for deleted message IDs
+                if msg_ids:
+                    for vec_table in ("vec_messages", "vec_messages_sep"):
+                        if vec_table not in _ALLOWED_TABLES:
+                            raise ValueError(f"Invalid table name: {vec_table}")
+                        try:
+                            self.conn.execute(
+                                f"DELETE FROM {vec_table} WHERE rowid IN ({placeholders})",
+                                msg_ids,
+                            )
+                        except Exception:
+                            logger.warning("Failed to clean %s for user %s", vec_table, user_id, exc_info=True)
+
+            else:
+                # Full wipe of all tables
+                cursor = self.conn.execute("DELETE FROM messages")
+                deleted = cursor.rowcount > 0
+
+                for table in (
+                    "entity_profiles",
+                    "entity_style_vectors",
+                    "fact_timeline",
+                    "summaries",
+                    "episodes",
+                    "landmark_events",
+                    "causal_edges",
+                    "entity_relationships",
+                ):
+                    if table not in _ALLOWED_TABLES:
+                        raise ValueError(f"Invalid table name: {table}")
+                    try:
+                        self.conn.execute(f"DELETE FROM {table}")
+                    except Exception:
+                        logger.warning("Failed to clear table %s during delete_all", table, exc_info=True)
+
+                # Clear vector tables
                 for vec_table in ("vec_messages", "vec_messages_sep"):
                     if vec_table not in _ALLOWED_TABLES:
                         raise ValueError(f"Invalid table name: {vec_table}")
                     try:
-                        self.conn.execute(
-                            f"DELETE FROM {vec_table} WHERE rowid IN ({placeholders})",
-                            msg_ids,
-                        )
+                        self.conn.execute(f"DELETE FROM {vec_table}")
                     except Exception:
-                        logger.debug("Failed to clean %s for user %s", vec_table, user_id, exc_info=True)
+                        logger.warning("Failed to clear %s during delete_all", vec_table, exc_info=True)
 
-        else:
-            # Full wipe of all tables
-            cursor = self.conn.execute("DELETE FROM messages")
-            deleted = cursor.rowcount > 0
+            # Rebuild FTS index
+            try:
+                self.conn.execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")
+            except Exception:
+                logger.warning("Failed to rebuild FTS index during delete_all", exc_info=True)
 
-            for table in (
-                "entity_profiles",
-                "entity_style_vectors",
-                "fact_timeline",
-                "summaries",
-                "episodes",
-                "landmark_events",
-                "causal_edges",
-                "entity_relationships",
-            ):
-                if table not in _ALLOWED_TABLES:
-                    raise ValueError(f"Invalid table name: {table}")
-                try:
-                    self.conn.execute(f"DELETE FROM {table}")
-                except Exception:
-                    logger.debug("Failed to clear table %s during delete_all", table, exc_info=True)
-
-            # Clear vector tables
-            for vec_table in ("vec_messages", "vec_messages_sep"):
-                if vec_table not in _ALLOWED_TABLES:
-                    raise ValueError(f"Invalid table name: {vec_table}")
-                try:
-                    self.conn.execute(f"DELETE FROM {vec_table}")
-                except Exception:
-                    logger.debug("Failed to clear %s during delete_all", vec_table, exc_info=True)
-
-        # Rebuild FTS index
-        try:
-            self.conn.execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")
-        except Exception:
-            logger.debug("Failed to rebuild FTS index during delete_all", exc_info=True)
-
-        self.conn.commit()
-        return deleted
+            self.conn.commit()
+            return deleted
 
     def update(self, memory_id: int, content: str | None = None, **fields) -> dict | None:
         """Update a memory.
@@ -635,28 +646,29 @@ class TrueMemoryEngine:
             Updated memory dict, or None if not found.
         """
         self._ensure_connection()
-        if content is not None:
-            fields["content"] = content
+        with self._write_lock:
+            if content is not None:
+                fields["content"] = content
 
-        ok = update_message(self.conn, memory_id, **fields)
-        if not ok:
-            return None
+            ok = update_message(self.conn, memory_id, **fields)
+            if not ok:
+                return None
 
-        # Re-embed if content changed
-        if content is not None and self._has_vectors:
-            try:
-                from truememory.vector_search import embed_single
-                # Remove old embedding, insert new
+            # Re-embed if content changed
+            if content is not None and self._has_vectors:
                 try:
-                    self.conn.execute("DELETE FROM vec_messages WHERE rowid = ?", (memory_id,))
+                    from truememory.vector_search import embed_single
+                    # Remove old embedding, insert new
+                    try:
+                        self.conn.execute("DELETE FROM vec_messages WHERE rowid = ?", (memory_id,))
+                    except Exception:
+                        logger.debug("Failed to delete old vector embedding for message %d", memory_id, exc_info=True)
+                    embed_single(self.conn, memory_id, content)
                 except Exception:
-                    logger.debug("Failed to delete old vector embedding for message %d", memory_id, exc_info=True)
-                embed_single(self.conn, memory_id, content)
-            except Exception:
-                logger.warning("Vector embedding failed for message %d", memory_id, exc_info=True)
+                    logger.warning("Vector embedding failed for message %d", memory_id, exc_info=True)
 
-        # Persist vector embedding and any profile updates
-        self.conn.commit()
+            # Persist vector embedding and any profile updates
+            self.conn.commit()
 
         return self.get(memory_id)
 
