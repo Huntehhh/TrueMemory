@@ -98,7 +98,7 @@ def test_edge_ceiling_by_cpu_cores(tmp_path, monkeypatch):
     caps = []
     for _ in range(15):
         caps.append(core._get_spawn_cap())
-    assert max(caps) == 8, f"Edge 10-core should max at 8, got {max(caps)}"
+    assert max(caps) == 5, f"Edge 10-core should max at 5, got {max(caps)}"
 
     # 4-core Air — ceiling = min(3, 8) = 3
     monkeypatch.setattr(core, "_get_physical_cores", lambda: 4)
@@ -183,11 +183,11 @@ def test_warn_halves_cap_after_hysteresis(tmp_path, monkeypatch):
     # Warn 1 — no action (hysteresis)
     monkeypatch.setattr(core, "_get_memory_free_pct", lambda: 30)
     cap1 = core._get_spawn_cap()
-    assert cap1 == 8, f"Single warn should not reduce, got {cap1}"
+    assert cap1 == 5, f"Single warn should not reduce, got {cap1}"
 
     # Warn 2 — halve
     cap2 = core._get_spawn_cap()
-    assert cap2 == 4, f"Sustained warn should halve to 4, got {cap2}"
+    assert cap2 == 2, f"Sustained warn should halve to 2, got {cap2}"
 
 
 def test_critical_drops_to_floor(tmp_path, monkeypatch):
@@ -274,9 +274,9 @@ def test_ramp_up_persists_across_calls(tmp_path, monkeypatch):
     monkeypatch.setattr(core, "_get_swap_used_gb", lambda: 0.0)
     monkeypatch.setattr(core, "_SPAWN_CAP_STATE_PATH", tmp_path / ".state")
 
-    # Ramp up several ticks
+    # Ramp up a few ticks (not to ceiling so we can verify continued ramp)
     caps = []
-    for _ in range(5):
+    for _ in range(3):
         caps.append(core._get_spawn_cap())
 
     # Verify state was written and reflects ramp-up
@@ -290,7 +290,7 @@ def test_ramp_up_persists_across_calls(tmp_path, monkeypatch):
     # Next call should continue ramp-up from persisted state
     next_cap = core._get_spawn_cap()
     assert next_cap == caps[-1] + 1, f"Should ramp from {caps[-1]} to {caps[-1]+1}, got {next_cap}"
-    assert next_cap <= 8, "Should never exceed Edge hard ceiling of 8"
+    assert next_cap <= 5, "Should never exceed Edge hard ceiling of 5"
 
 
 def test_state_expires_after_timeout(tmp_path, monkeypatch):
@@ -346,7 +346,7 @@ def test_single_warn_does_not_reduce(tmp_path, monkeypatch):
     # Single warn
     monkeypatch.setattr(core, "_get_memory_free_pct", lambda: 30)
     cap = core._get_spawn_cap()
-    assert cap == 8, f"Single warn should not reduce, got {cap}"
+    assert cap == 5, f"Single warn should not reduce, got {cap}"
 
     # Back to normal — warn count resets
     monkeypatch.setattr(core, "_get_memory_free_pct", lambda: 90)

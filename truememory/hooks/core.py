@@ -35,7 +35,7 @@ BACKLOG_DIR = Path.home() / ".truememory" / "backlog"
 # ---------------------------------------------------------------------------
 
 # Edge: CPU-bound (Model2Vec is numpy, no GPU). Cap by core count.
-_EDGE_HARD_CEILING = 8
+_EDGE_HARD_CEILING = 5
 # Base/Pro: GPU-bound (Qwen3 on MPS). Cap by unified memory.
 _GPU_HARD_CEILING = 6
 _GPU_OS_RESERVE_GB = 2
