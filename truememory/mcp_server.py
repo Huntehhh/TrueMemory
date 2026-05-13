@@ -1132,12 +1132,20 @@ def _drain_batch_from_backlog(markers: list[Path]) -> None:
                     cmd.extend(["--user", data["user_id"]])
                 if data.get("db_path"):
                     cmd.extend(["--db", data["db_path"]])
+                _log_dir = Path.home() / ".truememory" / "logs"
+                _log_dir.mkdir(parents=True, exist_ok=True)
+                _log_file = open(
+                    _log_dir / f"{data.get('session_id', 'unknown')}.log",
+                    "a", encoding="utf-8",
+                )
                 proc = _subprocess.Popen(
                     cmd,
-                    stdout=_subprocess.DEVNULL,
-                    stderr=_subprocess.DEVNULL,
+                    stdout=_log_file,
+                    stderr=_subprocess.STDOUT,
+                    stdin=_subprocess.DEVNULL,
                     start_new_session=True,
                 )
+                _log_file.close()
                 register_spawned_pid(proc.pid)
                 marker_path.unlink(missing_ok=True)
 
