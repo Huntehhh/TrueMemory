@@ -660,15 +660,27 @@ def _run_upgrade_tier(args):
         print(f"Already on {tier} tier. Use --force to re-embed anyway.")
         return
 
+    from truememory.tier_switch.cache import get_transition_action
+
+    action = get_transition_action(old_tier, tier, force=args.force)
+
+    if action == "noop":
+        print(f"Already on {tier} tier.")
+        return
+
+    if action == "config_only":
+        config["tier"] = tier
+        _save_truememory_config(config)
+        os.environ["TRUEMEMORY_EMBED_MODEL"] = tier
+        from truememory.vector_search import set_embedding_model
+        set_embedding_model(tier)
+        from truememory.reranker import set_active_tier
+        set_active_tier(tier)
+        print(f"\033[32m✓ Switched to {tier} instantly (same embedding model)\033[0m")
+        return
+
     print(f"Switching from {old_tier} to {tier}...")
 
-    # Save tier to config
-    config["tier"] = tier
-    _save_truememory_config(config)
-
-    # Switch active models and re-embed.
-    # All models are pre-downloaded during install — this just switches
-    # which one is active and re-embeds existing memories.
     os.environ.pop("HF_HUB_OFFLINE", None)
     os.environ.pop("TRANSFORMERS_OFFLINE", None)
     try:
@@ -679,31 +691,33 @@ def _run_upgrade_tier(args):
         from truememory.reranker import set_active_tier
         set_active_tier(tier)
 
-        from truememory import Memory
-        mem = Memory()
-        engine = mem._engine
-        engine._ensure_connection()
-        conn = engine.conn
-        count = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+        from truememory.tier_switch.manager import RebuildManager
 
-        if count > 0:
-            print(f"  Re-embedding {count} memories with {tier} model...")
-            conn.execute("DROP TABLE IF EXISTS vec_messages")
-            conn.execute("DROP TABLE IF EXISTS vec_messages_sep")
-            conn.commit()
-            from truememory.vector_search import (
-                build_separation_vectors,
-                build_vectors,
-                init_vec_table,
+        def progress_callback(processed, total, metrics):
+            pct = metrics.get("progress_pct", 0)
+            eta = metrics.get("eta_seconds", 0)
+            bs = metrics.get("batch_size", 0)
+            ram = metrics.get("ram_pct", 0)
+            print(
+                f"\r  Re-embedding: {pct:.0f}% ({processed}/{total}) "
+                f"| ETA {eta:.0f}s | BS={bs} | RAM={ram:.0f}%",
+                end="", flush=True,
             )
-            init_vec_table(conn)
-            build_vectors(conn)
-            build_separation_vectors(conn)
-            print(f"  \033[32m✓ {count} memories re-embedded\033[0m")
+
+        manager = RebuildManager()
+        success = manager.run_rebuild_sync(
+            target_tier=tier,
+            force=args.force,
+            progress_callback=progress_callback,
+        )
+
+        if success:
+            print(f"\n  \033[32m✓ Tier switched to {tier}\033[0m")
         else:
-            print("  No existing memories to re-embed.")
+            print("\n  \033[31m✗ Rebuild failed. Run again to retry.\033[0m")
+            sys.exit(1)
     except Exception as e:
-        print(f"\033[31mError during tier switch: {e}\033[0m", file=sys.stderr)
+        print(f"\n\033[31mError during tier switch: {e}\033[0m", file=sys.stderr)
         print("Config was saved. Re-run to retry, or use truememory-ingest setup.")
         sys.exit(1)
     finally:

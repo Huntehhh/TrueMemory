@@ -810,15 +810,9 @@ def truememory_configure(
 
     # Apply model change — temporarily allow downloads for tier switch
     # (the new model may not be cached yet).
-    #
-    # wrap pop + restore in try/finally. Without this, any
-    # exception between the pop (line below) and the restore at the
-    # bottom (e.g. `set_embedding_model` raising on a removed model,
-    # model-download failure, disk-full during re-embed) leaves offline
-    # mode PERMANENTLY disabled for the process, and subsequent
-    # searches silently hit the network on every cache miss.
-    rebuilt = False
     rebuild_error: str | None = None
+    rebuild_action: str | None = None
+    rebuild_status_id: int = 0
     os.environ.pop("HF_HUB_OFFLINE", None)
     os.environ.pop("TRANSFORMERS_OFFLINE", None)
     try:
@@ -826,54 +820,39 @@ def truememory_configure(
         from truememory.vector_search import set_embedding_model
         set_embedding_model(tier)
 
-        # Tell the reranker module about the new tier so get_reranker(model_name=None)
-        # calls (from direct Python-API users via rerank_with_modality_fusion etc.)
-        # resolve to the tier-correct model. Then pre-load that reranker so the
-        # first post-configure search doesn't pay a cold-start.
         from truememory.reranker import set_active_tier as _set_active_tier
         _set_active_tier(tier)
         _set_reranker(_current_reranker())
 
-        # If tier actually changed, re-embed any existing memories.
-        # (1) rebuild BOTH vec_messages and vec_messages_sep (the
-        # old code only rebuilt the completion table, leaving the separation
-        # table silently empty); (2) surface exceptions as rebuild_error in
-        # the response payload instead of swallowing into bare pass; (3) null
-        # _memory in `finally` so the next call always gets a fresh instance
-        # with the new model — even on failure.
+        # Tier-switch: determine transition action and handle accordingly.
+        # Base↔Pro = instant (same embedding model). Cross-group = async rebuild.
         if old_tier != tier:
             try:
-                m = _get_memory()
-                engine = m._engine
-                engine._ensure_connection()
-                conn = engine.conn
-                count = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
-                if count > 0:
-                    conn.execute("DROP TABLE IF EXISTS vec_messages")
-                    conn.execute("DROP TABLE IF EXISTS vec_messages_sep")
-                    conn.commit()
-                    from truememory.vector_search import (
-                        build_separation_vectors,
-                        build_vectors,
-                        init_vec_table,
+                from truememory.tier_switch.cache import (
+                    get_transition_action,
+                )
+                action = get_transition_action(old_tier, tier)
+                rebuild_action = action
+
+                if action == "config_only":
+                    pass  # Base↔Pro: same embeddings, nothing to rebuild
+
+                elif action == "delta_or_full":
+                    from truememory.tier_switch.manager import RebuildManager
+                    manager = RebuildManager.get_instance()
+                    rebuild_status_id = manager.start_rebuild(
+                        target_tier=tier,
                     )
-                    init_vec_table(conn)
-                    build_vectors(conn)
-                    build_separation_vectors(conn)
-                    rebuilt = True
             except Exception as e:
                 rebuild_error = f"{type(e).__name__}: {e}"
-                log.exception("truememory_configure re-embed failed")
+                log.exception("truememory_configure tier-switch failed")
             finally:
                 with _memory_lock:
-                    _memory = None  # Always force re-init, even on failure
+                    _memory = None
     finally:
-        # Always restore offline mode, even if set_embedding_model or the
-        # rebuild block raised before we got to their own cleanup.
         os.environ["HF_HUB_OFFLINE"] = "1"
         os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
-    # Build result with onboarding info
     _tier_descriptions = {
         "edge": "Edge: Model2Vec embeddings (8M params), MiniLM reranker",
         "base": "Base: Qwen3 embeddings (256d), gte-reranker-modernbert",
@@ -884,8 +863,14 @@ def truememory_configure(
         "tier": tier,
         "description": _tier_descriptions.get(tier, f"Tier: {tier}"),
     }
-    if rebuilt:
-        result["note"] = "Existing memories have been re-embedded with the new model."
+    if rebuild_action == "config_only":
+        result["note"] = "Tier switched instantly (same embedding model)."
+    elif rebuild_status_id:
+        result["note"] = (
+            f"Re-embedding started in background (status_id={rebuild_status_id}). "
+            f"Query progress with truememory_status({rebuild_status_id})."
+        )
+        result["status_id"] = rebuild_status_id
     if rebuild_error is not None:
         result["rebuild_error"] = rebuild_error
         result["warning"] = (
@@ -938,6 +923,25 @@ def truememory_configure(
     )
 
     return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+@_tracked("tool_status")
+def truememory_status(status_id: int = 0) -> str:
+    """Check the progress of a tier-switch re-embedding operation.
+
+    Args:
+        status_id: The status ID returned by truememory_configure when
+                   a re-embedding was started. Pass 0 (default) to get
+                   the most recent rebuild status.
+    """
+    try:
+        from truememory.tier_switch.manager import RebuildManager
+        manager = RebuildManager.get_instance()
+        status = manager.get_status(status_id)
+        return json.dumps(status, indent=2, default=str)
+    except Exception as e:
+        return json.dumps({"error": f"{type(e).__name__}: {e}"})
 
 
 @mcp.tool()

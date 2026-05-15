@@ -167,6 +167,43 @@ CREATE INDEX IF NOT EXISTS idx_summaries_entity ON summaries(entity);
 CREATE INDEX IF NOT EXISTS idx_summaries_period ON summaries(period);
 CREATE INDEX IF NOT EXISTS idx_entity_relationships_a ON entity_relationships(entity_a);
 CREATE INDEX IF NOT EXISTS idx_landmark_events_timestamp ON landmark_events(timestamp);
+
+-- Vector cache registry (tier-switch: tracks per-tier-group vector table state)
+CREATE TABLE IF NOT EXISTS vector_cache_registry (
+    tier_group TEXT PRIMARY KEY,
+    vec_table TEXT NOT NULL,
+    sep_table TEXT NOT NULL,
+    last_embedded_id INTEGER DEFAULT 0,
+    vector_count INTEGER DEFAULT 0,
+    model_name TEXT,
+    embedding_dim INTEGER DEFAULT 256,
+    last_updated REAL,
+    created REAL
+);
+
+-- Rebuild status (tier-switch: tracks async rebuild progress)
+CREATE TABLE IF NOT EXISTS rebuild_status (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tier_group TEXT NOT NULL,
+    target_tier TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    action TEXT,
+    total_messages INTEGER DEFAULT 0,
+    processed_messages INTEGER DEFAULT 0,
+    progress_pct REAL DEFAULT 0,
+    eta_seconds REAL DEFAULT 0,
+    batch_size INTEGER DEFAULT 0,
+    throughput_ips REAL DEFAULT 0,
+    ram_pct REAL DEFAULT 0,
+    pressure REAL DEFAULT 0,
+    error TEXT,
+    started_at REAL,
+    completed_at REAL,
+    backup_path TEXT,
+    last_heartbeat REAL
+);
+CREATE INDEX IF NOT EXISTS idx_rebuild_status_active
+    ON rebuild_status(tier_group, status);
 """
 
 
@@ -480,15 +517,21 @@ def delete_message(conn: sqlite3.Connection, msg_id: int) -> bool:
     deleted = cursor.rowcount > 0
 
     if deleted:
-        # Clean up vector embedding (best-effort — table may not exist)
-        try:
-            conn.execute("DELETE FROM vec_messages WHERE rowid = ?", (msg_id,))
-        except sqlite3.OperationalError:
-            pass
-        try:
-            conn.execute("DELETE FROM vec_messages_sep WHERE rowid = ?", (msg_id,))
-        except sqlite3.OperationalError:
-            pass
+        for tbl in (
+            "vec_messages", "vec_messages_edge", "vec_messages_basepro",
+        ):
+            try:
+                conn.execute(f"DELETE FROM {tbl} WHERE rowid = ?", (msg_id,))
+            except sqlite3.OperationalError:
+                pass
+        for tbl in (
+            "vec_messages_sep", "vec_messages_sep_edge",
+            "vec_messages_sep_basepro",
+        ):
+            try:
+                conn.execute(f"DELETE FROM {tbl} WHERE rowid = ?", (msg_id,))
+            except sqlite3.OperationalError:
+                pass
 
     conn.commit()
     return deleted
