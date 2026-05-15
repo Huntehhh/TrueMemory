@@ -111,6 +111,18 @@ def _parse_args() -> argparse.Namespace:
 
 def main():
     if os.environ.get("TRUEMEMORY_EXTRACTION"):
+        try:
+            input_data = json.load(sys.stdin)
+        except (json.JSONDecodeError, EOFError):
+            input_data = {}
+        transcript_path = input_data.get("transcript_path", "")
+        session_id = input_data.get("session_id", "")
+        if transcript_path and session_id:
+            from truememory.ingest.hooks._shared import mark_session_extracted
+            try:
+                mark_session_extracted(session_id, transcript_path)
+            except Exception as exc:
+                log.debug("stop hook: failed to mark extraction session %s: %s", session_id, exc)
         return
 
     args = _parse_args()

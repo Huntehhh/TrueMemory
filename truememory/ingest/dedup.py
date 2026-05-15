@@ -49,6 +49,7 @@ class DedupDecision:
 
 
 DEDUP_PROMPT = """\
+[[TRUEMEMORY_INTERNAL_EXTRACTION]]
 You are comparing a NEW fact against an EXISTING memory to decide what to do.
 
 NEW FACT: {new_fact}

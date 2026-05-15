@@ -32,6 +32,7 @@ log = logging.getLogger(__name__)
 
 
 EXTRACTION_SYSTEM = """\
+[[TRUEMEMORY_INTERNAL_EXTRACTION]]
 You are a memory extraction system. Your job is to extract atomic facts \
 from conversations that should be remembered for future interactions.
 

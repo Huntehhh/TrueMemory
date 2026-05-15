@@ -37,6 +37,12 @@ _SCAN_MARKER = Path.home() / ".truememory" / ".last_stale_scan"
 _SCAN_INTERVAL = 900  # 15 minutes
 _SCAN_CAP = 3  # max sessions to queue per scan
 
+_EXTRACTION_SENTINEL = "[[TRUEMEMORY_INTERNAL_EXTRACTION]]"
+_EXTRACTION_LEGACY_PREFIXES = (
+    "You are a memory extraction system",
+    "You are comparing a NEW fact",
+)
+
 BANNER = r"""
 ████████╗██████╗ ██╗   ██╗███████╗    ███╗   ███╗███████╗███╗   ███╗ ██████╗ ██████╗ ██╗   ██╗
 ╚══██╔══╝██╔══██╗██║   ██║██╔════╝    ████╗ ████║██╔════╝████╗ ████║██╔═══██╗██╔══██╗╚██╗ ██╔╝
@@ -228,12 +234,45 @@ def _drain_backlog() -> None:
             log.debug("Failed to drain backlog entry %s: %s", marker_path.name, e)
 
 
+def _is_extraction_transcript(transcript_path: Path) -> bool:
+    """Check if a transcript is TrueMemory extraction noise, not a real conversation.
+
+    Looks for the structured sentinel tag or legacy extraction prompt prefixes
+    in the first user message. Reads only the first 30 lines of the file.
+    """
+    try:
+        with open(transcript_path, "r", encoding="utf-8", errors="replace") as f:
+            for i, line in enumerate(f):
+                if i > 30:
+                    break
+                try:
+                    data = json.loads(line)
+                    if data.get("type") != "user":
+                        continue
+                    msg = data.get("message", {})
+                    content = msg.get("content", "") if isinstance(msg, dict) else str(msg)
+                    if isinstance(content, list):
+                        content = content[0].get("text", "") if content else ""
+                    if _EXTRACTION_SENTINEL in content:
+                        return True
+                    for prefix in _EXTRACTION_LEGACY_PREFIXES:
+                        if content.startswith(prefix):
+                            return True
+                    return False
+                except (json.JSONDecodeError, KeyError, TypeError):
+                    continue
+    except OSError:
+        pass
+    return False
+
+
 def _scan_stale_sessions() -> None:
     """Find transcripts from recent sessions that were never extracted.
 
     Runs at most once per _SCAN_INTERVAL. Scans Claude Code's project
     directories for session transcripts modified in the last 24 hours
-    that have no corresponding extraction marker.
+    that have no corresponding extraction marker. Skips extraction noise
+    transcripts (identified by sentinel tag or legacy prompt prefixes).
     """
     import time
     import re
@@ -255,12 +294,13 @@ def _scan_stale_sessions() -> None:
     if not claude_dir.exists():
         return
 
-    from truememory.ingest.hooks._shared import EXTRACTED_DIR, _safe_session_id
+    from truememory.ingest.hooks._shared import EXTRACTED_DIR, _safe_session_id, mark_session_extracted
     from truememory.ingest.hooks.stop import _queue_to_backlog
 
     uuid_re = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
     cutoff = time.time() - 86400
     queued = 0
+    skipped_noise = 0
 
     for project_dir in claude_dir.iterdir():
         if not project_dir.is_dir():
@@ -290,6 +330,14 @@ def _scan_stale_sessions() -> None:
             if marker.exists():
                 continue
 
+            if _is_extraction_transcript(transcript):
+                try:
+                    mark_session_extracted(session_id, str(transcript))
+                except Exception:
+                    pass
+                skipped_noise += 1
+                continue
+
             _queue_to_backlog(
                 str(transcript), session_id, "", "",
                 reason="stale_session_recovery",
@@ -302,6 +350,8 @@ def _scan_stale_sessions() -> None:
 
     if queued > 0:
         log.info("Stale session scanner: queued %d unextracted sessions", queued)
+    if skipped_noise > 0:
+        log.info("Stale session scanner: skipped %d extraction noise transcripts", skipped_noise)
 
 
 def main():
