@@ -2,3 +2,4 @@
 
 from truememory.tier_switch.cache import VectorCacheRegistry
 from truememory.tier_switch.throttler import DynamicThrottler
+from truememory.tier_switch.worker import RebuildWorker
