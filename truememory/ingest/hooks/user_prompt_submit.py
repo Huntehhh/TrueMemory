@@ -181,10 +181,10 @@ def main():
                 TRACE_DIR.mkdir(parents=True, exist_ok=True)
                 LOG_DIR.mkdir(parents=True, exist_ok=True)
                 if _has_enough_messages(transcript_path, 10):
-                    _run_background_ingestion(
+                    spawned_pid = _run_background_ingestion(
                         transcript_path, session_id, args.user, args.db,
                     )
-                    mark_session_extracted(session_id, transcript_path)
+                    mark_session_extracted(session_id, transcript_path, spawned_pid=spawned_pid)
         except Exception:
             pass
 

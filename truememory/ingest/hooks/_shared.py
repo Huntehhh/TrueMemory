@@ -75,12 +75,18 @@ def _pid_is_alive(pid: int) -> bool:
         return False
 
 
-def mark_session_extracted(session_id: str, transcript_path: str) -> None:
+def mark_session_extracted(session_id: str, transcript_path: str, spawned_pid: int = 0) -> None:
     """Record that a session's transcript was extracted at its current size.
 
     Written by the ingest CLI on successful completion, and also by
     triggers before spawning (optimistic) to prevent concurrent duplicates.
     The CLI write is authoritative; the trigger write is best-effort.
+
+    Args:
+        spawned_pid: The PID of the background ingest process. When called
+            from a hook, pass the Popen PID so the liveness check in
+            should_extract_session() can detect a running extraction.
+            When called from the CLI itself, defaults to os.getpid().
     """
     if not session_id or session_id == "unknown":
         return
@@ -98,7 +104,7 @@ def mark_session_extracted(session_id: str, transcript_path: str) -> None:
         marker.write_text(json.dumps({
             "size": current_size,
             "timestamp": time.time(),
-            "pid": os.getpid(),
+            "pid": spawned_pid or os.getpid(),
         }), encoding="utf-8")
     except OSError:
         pass

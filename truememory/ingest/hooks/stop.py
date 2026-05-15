@@ -142,10 +142,10 @@ def main():
         log.info("stop hook: session %s already extracted at this size, skipping", session_id)
         return
 
-    _run_background_ingestion(transcript_path, session_id, args.user, args.db)
+    spawned_pid = _run_background_ingestion(transcript_path, session_id, args.user, args.db)
 
     try:
-        mark_session_extracted(session_id, transcript_path)
+        mark_session_extracted(session_id, transcript_path, spawned_pid=spawned_pid)
     except Exception:
         pass
 
@@ -306,7 +306,7 @@ def _run_background_ingestion(
     session_id: str,
     user_id: str,
     db_path: str,
-):
+) -> int:
     """Launch the ingestion pipeline as a background process.
 
     Captures stderr/stdout to a log file so silent failures are recoverable.
@@ -377,7 +377,7 @@ def _run_background_ingestion(
                 transcript_path, session_id, user_id, db_path,
                 reason=f"spawn_cap_reached:SPAWN_CAP={effective_cap}",
             )
-            return
+            return 0
 
         log_file = None
         try:
@@ -391,6 +391,7 @@ def _run_background_ingestion(
                 **detach_kwargs,
             )
             register_spawned_pid(proc.pid)
+            return proc.pid
         except Exception as e:
             log.warning(
                 "stop hook: background launch failed (%s); queueing session "
@@ -401,12 +402,14 @@ def _run_background_ingestion(
                 transcript_path, session_id, user_id, db_path,
                 reason=f"popen_failed:{type(e).__name__}:{e}",
             )
+            return 0
         finally:
             if log_file is not None:
                 try:
                     log_file.close()
                 except Exception:
                     pass
+    return 0
 
 
 if __name__ == "__main__":
