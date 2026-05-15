@@ -517,15 +517,21 @@ def delete_message(conn: sqlite3.Connection, msg_id: int) -> bool:
     deleted = cursor.rowcount > 0
 
     if deleted:
-        # Clean up vector embedding (best-effort — table may not exist)
-        try:
-            conn.execute("DELETE FROM vec_messages WHERE rowid = ?", (msg_id,))
-        except sqlite3.OperationalError:
-            pass
-        try:
-            conn.execute("DELETE FROM vec_messages_sep WHERE rowid = ?", (msg_id,))
-        except sqlite3.OperationalError:
-            pass
+        for tbl in (
+            "vec_messages", "vec_messages_edge", "vec_messages_basepro",
+        ):
+            try:
+                conn.execute(f"DELETE FROM {tbl} WHERE rowid = ?", (msg_id,))
+            except sqlite3.OperationalError:
+                pass
+        for tbl in (
+            "vec_messages_sep", "vec_messages_sep_edge",
+            "vec_messages_sep_basepro",
+        ):
+            try:
+                conn.execute(f"DELETE FROM {tbl} WHERE rowid = ?", (msg_id,))
+            except sqlite3.OperationalError:
+                pass
 
     conn.commit()
     return deleted
