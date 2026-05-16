@@ -59,7 +59,7 @@ ${\color{#1a73e8}\textbf{\textsf{Step 3.}}}$ Wait 3-5 minutes for installation.
 
 &nbsp;
 
-${\color{#1a73e8}\textbf{\textsf{Step 4.}}}$ Quit Claude completely and reopen it (Mac: `Cmd+Q`, Windows: close all Claude windows).
+${\color{#1a73e8}\textbf{\textsf{Step 4.}}}$ Quit Claude completely and reopen it (Mac: `Cmd+Q`, Windows: right-click the Claude icon in the system tray → **Quit** — clicking X only minimizes it, the MCP config only loads at a full launch).
 
 &nbsp;
 
@@ -372,7 +372,7 @@ Find me on X [@Building_Josh](https://x.com/Building_Josh) · Follow us [@Sauron
   organization = {Sauron},
   year = {2026},
   url = {https://github.com/buildingjoshbetter/TrueMemory},
-  version = {0.6.0}
+  version = {0.6.8}
 }
 ```
 
