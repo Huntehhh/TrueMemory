@@ -37,8 +37,12 @@ Dependencies:
 
 from __future__ import annotations
 
+import logging
 import sqlite3
+import time
 from collections import defaultdict
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -175,8 +179,10 @@ def search_hybrid(
     # ------------------------------------------------------------------
     from truememory.vector_search import get_model, serialize_f32
     _q_model = get_model()
+    _t_embed = time.time()
     _q_emb = _q_model.encode([query])[0]
     _q_blob = serialize_f32(_q_emb)
+    _embed_ms = (time.time() - _t_embed) * 1000
 
     fts_results = search_fts(conn, query, limit=_CANDIDATE_POOL)
     vec_results = search_vector(conn, query, limit=_CANDIDATE_POOL, _query_blob=_q_blob)
@@ -197,6 +203,12 @@ def search_hybrid(
         except Exception:
             pass
 
+    logger.debug(
+        "hybrid.search_hybrid embed_ms=%.1f fts_n=%d vec_n=%d sep_n=%d sep_gate=%s",
+        _embed_ms, len(fts_results), len(vec_results), len(sep_results),
+        "open" if sep_results else "closed",
+    )
+
     # ------------------------------------------------------------------
     # 2. Build rank maps for provenance tracking.
     # ------------------------------------------------------------------
@@ -216,6 +228,12 @@ def search_hybrid(
     k = 60
     scores: dict[int, float] = defaultdict(float)
     best_doc: dict[int, dict] = {}
+    _unique_ids_prefuse: set = set()
+    for _lst in (fts_results, vec_results, sep_results):
+        for _d in _lst:
+            if _d.get("id") is not None:
+                _unique_ids_prefuse.add(_d["id"])
+    logger.debug("hybrid.rrf k=%d fts_w=%.2f vec_w=%.2f unique_ids=%d", k, fts_weight, vec_weight, len(_unique_ids_prefuse))
 
     for rank_0, doc in enumerate(fts_results):
         doc_id = doc["id"]
@@ -265,5 +283,11 @@ def search_hybrid(
 
     # Sort by RRF score descending (tie-break by id for determinism).
     fused.sort(key=lambda d: (-d["rrf_score"], d["id"]))
+
+    _top = fused[0]["rrf_score"] if fused else 0.0
+    logger.debug(
+        "hybrid.search_hybrid result n=%d top_score=%.6f limit=%d",
+        len(fused[:limit]), _top, limit,
+    )
 
     return fused[:limit]

@@ -112,13 +112,33 @@ def _parse_args() -> argparse.Namespace:
 def main():
     args = _parse_args()
 
+    # ── HUNK #1 (PREREQUISITE) ────────────────────────────────────────────────
+    # Stop hook runs as a detached subprocess. Python logging defaults to
+    # NullHandler in that context — every log.info/warning/error call is a
+    # no-op without this basicConfig. Wire a file handler here, at the
+    # earliest possible point, before any other log call in this process.
+    # We read stdin once here and re-use the parsed dict below.
     try:
-        input_data = json.load(sys.stdin)
+        _pre_input = json.load(sys.stdin)
     except (json.JSONDecodeError, EOFError):
-        input_data = {}
+        _pre_input = {}
+    _pre_session_id = _pre_input.get("session_id", "unknown")
+    _safe_session_id = _sanitize_session_id(_pre_session_id)
+    _log_dir = Path(os.environ.get("TRUEMEMORY_LOG_DIR", str(Path.home() / ".truememory" / "logs")))
+    _log_dir.mkdir(parents=True, exist_ok=True)
+    logging.basicConfig(
+        filename=str(_log_dir / f"stop-hook-{_safe_session_id}.log"),
+        level=logging.INFO,
+        format="%(asctime)s pid=%(process)d %(levelname)s %(name)s %(message)s",
+    )
+    # ── end HUNK #1 ──────────────────────────────────────────────────────────
+
+    input_data = _pre_input  # re-use already-parsed dict
 
     transcript_path = input_data.get("transcript_path", "")
     session_id = input_data.get("session_id", "unknown")
+
+    log.info("stop hook: FIRED session=%s transcript=%s", session_id, transcript_path)
 
     if not transcript_path or not Path(transcript_path).exists():
         return
@@ -132,6 +152,10 @@ def main():
     # instead of substring-matching (which false-positives on content that
     # contains the literal strings "human" or "user").
     if not _has_enough_messages(transcript_path, MIN_MESSAGES):
+        log.info(
+            "stop hook: SKIP min_messages=%d session=%s transcript=%s",
+            MIN_MESSAGES, session_id, transcript_path,
+        )
         return
 
     # Run ingestion in the background so we don't block Claude Code
@@ -283,6 +307,10 @@ def _queue_to_backlog(
             "queued_at": datetime.now(timezone.utc).isoformat(),
             "reason": reason,
         }), encoding="utf-8")
+        log.info(
+            "backlog: queued session=%s reason=%s marker=%s",
+            session_id, reason, str(marker),
+        )
     except Exception as e:
         # Best-effort: if we can't write the backlog marker, the session's
         # memories are lost — log and move on. Must not raise.
@@ -376,6 +404,7 @@ def _run_background_ingestion(
                 close_fds=(sys.platform != "win32"),
                 **detach_kwargs,
             )
+            log.info("stop hook: spawned pid=%d session=%s cmd=%s", proc.pid, session_id, cmd[0])
             register_spawned_pid(proc.pid)
         except Exception as e:
             log.warning(

@@ -338,6 +338,15 @@ class TrueMemoryEngine:
                     self.conn.enable_load_extension(False)
                     init_vec_table(self.conn)
                     self._has_vectors = True
+                    _dim_row = self.conn.execute(
+                        "SELECT COUNT(*) FROM vec_messages"
+                    ).fetchone()
+                    logger.debug(
+                        "engine.init sqlite_vec_loaded model=%s has_vectors=%s vec_rows=%d",
+                        os.environ.get("TRUEMEMORY_EMBED_MODEL", "edge"),
+                        self._has_vectors,
+                        _dim_row[0] if _dim_row else 0,
+                    )
                 except Exception:
                     logger.debug("Failed to load sqlite-vec extension", exc_info=True)
                     self._has_vectors = False
@@ -444,9 +453,14 @@ class TrueMemoryEngine:
                     serialize_f32,
                 )
                 model = get_model()
+                _t_enc = time.time()
                 content_blob = serialize_f32(model.encode([content])[0])
                 sep_text = _build_sep_text(sender, recipient, timestamp, content)
                 sep_blob = serialize_f32(model.encode([sep_text])[0])
+                logger.debug(
+                    "engine.add embed_ms=%.1f content_len=%d",
+                    (time.time() - _t_enc) * 1000, len(content),
+                )
             except Exception:
                 logger.debug("Failed to pre-compute embeddings during add()", exc_info=True)
 
@@ -473,6 +487,7 @@ class TrueMemoryEngine:
                             "INSERT INTO vec_messages_sep(rowid, embedding) VALUES (?, ?)",
                             (new_id, sep_blob),
                         )
+                    logger.debug("engine.add vec_insert new_id=%s", new_id)
                 except Exception:
                     logger.debug("Failed to insert pre-computed vectors for message %s", new_id, exc_info=True)
 
@@ -492,7 +507,12 @@ class TrueMemoryEngine:
                     logger.debug("Failed to update style vector for %s during add()", sender, exc_info=True)
 
             # Persist vector embedding and any profile updates
+            _t_commit = time.time()
             self.conn.commit()
+            logger.debug(
+                "engine.add commit_ms=%.1f new_id=%s",
+                (time.time() - _t_commit) * 1000, new_id,
+            )
 
         return {
             "id": new_id,
@@ -1094,6 +1114,12 @@ class TrueMemoryEngine:
                 t0 = time.time()
                 detect_contradictions(self.conn)
                 stats["detect_contradictions"] = f"{time.time() - t0:.3f}s"
+                _contra_count = self.conn.execute(
+                    "SELECT COUNT(*) FROM contradictions"
+                ).fetchone()
+                logger.debug("engine.ingest detect_contradictions n=%d elapsed=%s",
+                             _contra_count[0] if _contra_count else -1,
+                             stats["detect_contradictions"])
             except Exception as exc:
                 stats["detect_contradictions"] = f"ERROR: {exc}"
                 logger.debug("detect_contradictions failed", exc_info=True)
@@ -1302,6 +1328,14 @@ class TrueMemoryEngine:
 
         fts_w = query_info["weights"].get("fts", 1.0)
         vec_w = query_info["weights"].get("vec", 1.0)
+        logger.debug(
+            "engine.search query_classified type=%s mode=%s fts_w=%.2f vec_w=%.2f confidence=%.2f",
+            query_info.get("query_type", "general"),
+            search_mode,
+            fts_w,
+            vec_w,
+            query_info.get("confidence", 0.5),
+        )
 
         # ── 1. Primary retrieval with adaptive weights (A1) ──────────────
         if self._has_hybrid:
@@ -1311,6 +1345,7 @@ class TrueMemoryEngine:
                     fts_weight=fts_w, vec_weight=vec_w,
                 )
                 source_label = "hybrid"
+                logger.debug("engine.search hybrid_returned n=%d", len(results))
             except Exception:
                 logger.debug("Hybrid search failed, falling back to FTS5", exc_info=True)
                 results = []
@@ -1319,6 +1354,7 @@ class TrueMemoryEngine:
             try:
                 results = search_fts(self.conn, query, limit=limit * 3)
                 source_label = "fts"
+                logger.debug("engine.search fts_fallback_used n=%d", len(results))
                 # Normalize FTS results to match the hybrid output shape.
                 for r in results:
                     if "source" not in r:
@@ -1338,8 +1374,13 @@ class TrueMemoryEngine:
 
         # ── 2. Scent trail (A3) — only when sender diversity is high ─────
         if _high_diversity and len(results) >= 3:
+            _scent_in = len(results)
             try:
                 results = self._scent_trail(query, results, limit)
+                logger.debug(
+                    "engine.search scent_trail in=%d out=%d",
+                    _scent_in, len(results),
+                )
             except Exception:
                 logger.debug("Scent trail failed in search()", exc_info=True)
 
@@ -1354,6 +1395,13 @@ class TrueMemoryEngine:
         if self._has_temporal:
             try:
                 intent = detect_temporal_intent(query)
+                logger.debug(
+                    "engine.search temporal_intent has_temporal=%s dates=[%s,%s] is_trajectory=%s",
+                    intent.get("has_temporal"),
+                    intent.get("start_date"),
+                    intent.get("end_date"),
+                    intent.get("is_trajectory"),
+                )
                 if intent.get("has_temporal"):
                     # search_temporal takes the query + existing results and
                     # filters/re-ranks them using the detected time window.
@@ -1423,6 +1471,7 @@ class TrueMemoryEngine:
         # profile results (score=1.0) dominate factual queries.
         if self._has_personality and _has_personality_intent(query):
             try:
+                _personality_in = len(results)
                 personality_results = search_personality(self.conn, query, limit=5)
                 if personality_results:
                     existing_ids = {r.get("id") for r in results if r.get("id")}
@@ -1446,6 +1495,12 @@ class TrueMemoryEngine:
                         results.append(pr)
                         if pr_id:
                             existing_ids.add(pr_id)
+                _personality_injected = len(results) - _personality_in
+                logger.debug(
+                    "engine.search personality_supplemented intent=True l0_scale=%.2f injected=%d",
+                    _l0_scale if personality_results else 0.0,
+                    _personality_injected,
+                )
             except Exception:
                 logger.debug("Personality supplementation failed in search()", exc_info=True)
 
@@ -1453,6 +1508,8 @@ class TrueMemoryEngine:
         if self._has_consolidation:
             try:
                 contradiction_results = search_contradictions(self.conn, query)
+                logger.debug("engine.search search_contradictions returned n=%d",
+                             len(contradiction_results) if contradiction_results else 0)
                 if contradiction_results:
                     existing_ids = {r["id"] for r in results}
                     for cr in contradiction_results:
@@ -1465,6 +1522,8 @@ class TrueMemoryEngine:
 
             try:
                 consolidated = search_consolidated(self.conn, query, limit=3)
+                logger.debug("engine.search search_consolidated returned n=%d",
+                             len(consolidated) if consolidated else 0)
                 if consolidated:
                     existing_ids = {r["id"] for r in results}
                     for sr in consolidated:
@@ -1478,6 +1537,7 @@ class TrueMemoryEngine:
         # ── 7. Salience guard with mode-aware threshold (A5) ──────────────
         if self._has_salience and results:
             try:
+                _sal_in = len(results)
                 _sal_override = os.environ.get("TRUEMEMORY_MIN_SALIENCE")
                 if _sal_override is not None:
                     try:
@@ -1489,18 +1549,32 @@ class TrueMemoryEngine:
                 results = apply_salience_guard(
                     results, query, conn=self.conn, min_salience=min_sal,
                 )
+                logger.debug(
+                    "engine.search salience_guard mode=%s min_sal=%.4f in=%d out=%d",
+                    search_mode, min_sal, _sal_in, len(results),
+                )
             except Exception:
                 logger.debug("Salience guard failed in search()", exc_info=True)
 
         # ── 7.5 L5 surprise rerank boost (MEMORIST-L5) ──
         # Skipped when called from search_agentic() which applies its own
         # boost after merging all result sources.
+        logger.debug(
+            "engine.search surprise_boost skip=%s pool_size=%d",
+            _skip_surprise_boost, len(results),
+        )
         if not _skip_surprise_boost:
             results = self._apply_surprise_boost(results)
 
         # ── 8.6 Cross-encoder reranking ──────────────────────────────────
         # Skipped when called from search_agentic() which applies its own
         # reranking after merging all result sources.
+        logger.debug(
+            "engine.search reranker_call skip=%s pool_size=%d top_k=%d rrf_w=0.40 rerank_w=0.60",
+            _skip_reranker or not (self._has_reranker and len(results) > 1),
+            len(results),
+            limit,
+        )
         if not _skip_reranker and self._has_reranker and len(results) > 1:
             try:
                 from truememory.reranker import rerank_with_modality_fusion
@@ -1554,6 +1628,25 @@ class TrueMemoryEngine:
 
         # Sort by score descending, then by id for determinism.
         cleaned.sort(key=lambda d: (-d["score"], d["id"]))
+
+        _final = cleaned[:limit]
+        _top_score = _final[0]["score"] if _final else 0.0
+        _bot_score = _final[-1]["score"] if _final else 0.0
+        logger.info(
+            "engine.search complete returned=%d top_score=%.4f bot_score=%.4f",
+            len(_final), _top_score, _bot_score,
+        )
+        for _rank, _r in enumerate(_final, 1):
+            logger.info(
+                "memory_returned memory_id=%s rank=%d score=%.4f query_hash=%d",
+                _r.get("id"), _rank, _r.get("score", 0), hash(query) % 100000,
+            )
+        logger.info(
+            "search_distance query_len=%d result_count=%d top_score=%.4f",
+            len(query), len(_final),
+            _top_score,
+        )
+
         return cleaned[:limit]
 
     # ──────────────────────────────────────────────────────────────────────
@@ -1623,6 +1716,7 @@ class TrueMemoryEngine:
         primary_results = self.search(query, limit=candidate_pool, _skip_surprise_boost=True, _skip_reranker=True)
 
         # If HyDE available, run a parallel search and fuse with RRF
+        _hyde_before = len(primary_results)
         if use_hyde and self._has_hyde and self._has_hybrid and llm_fn:
             try:
                 hyde_results = hyde_search(
@@ -1632,6 +1726,10 @@ class TrueMemoryEngine:
                     from truememory.hybrid import reciprocal_rank_fusion
                     primary_results = reciprocal_rank_fusion(
                         [primary_results, hyde_results]
+                    )
+                    logger.debug(
+                        "engine.search_agentic hyde hyde_n=%d primary_before=%d fused_n=%d",
+                        len(hyde_results), _hyde_before, len(primary_results),
                     )
             except Exception:
                 logger.debug("HyDE search failed in search_agentic()", exc_info=True)
@@ -1679,12 +1777,14 @@ class TrueMemoryEngine:
                 entity_ids = {r.get("id") for r in entity_results if r.get("id")}
 
                 # Boost primary results that overlap with entity search
+                _entity_boosted = 0
                 for pr in primary_results:
                     pid = pr.get("id")
                     if pid and pid in entity_ids:
                         pr["score"] = pr.get("score", pr.get("rrf_score", 0)) * 1.5
                         if "entity_boost" not in pr.get("source", ""):
                             pr["source"] = pr.get("source", "") + "+entity_boost"
+                        _entity_boosted += 1
 
                 # Add genuinely new entity results at median primary score
                 primary_scores = [
@@ -1708,6 +1808,13 @@ class TrueMemoryEngine:
                         if added >= limit:
                             break
 
+                logger.debug(
+                    "engine.search_agentic entity_focused matched_senders=%d boosted=%d added_new=%d",
+                    len({r.get("sender") for r in entity_results if r.get("sender")}),
+                    _entity_boosted,
+                    added,
+                )
+
                 # Re-sort after boosting
                 primary_results.sort(
                     key=lambda d: (-d.get("score", d.get("rrf_score", 0)), d.get("id", 0))
@@ -1717,6 +1824,13 @@ class TrueMemoryEngine:
 
         # ── Sufficiency check ─────────────────────────────────────────────
         is_sufficient = self._check_sufficiency(primary_results[:5])
+        _suf_scores = [r.get("score", r.get("rrf_score", 0)) for r in primary_results[:5]]
+        _suf_avg = sum(_suf_scores) / len(_suf_scores) if _suf_scores else 0.0
+        _suf_prefixes = {r.get("content", "")[:100] for r in primary_results[:5]}
+        logger.debug(
+            "engine.search_agentic sufficiency is_sufficient=%s avg_score=%.4f unique_prefixes=%d",
+            is_sufficient, _suf_avg, len(_suf_prefixes),
+        )
 
         # ── Round 2: Refined queries (if not sufficient) ──────────────────
         if not is_sufficient and max_rounds >= 2 and llm_fn:
@@ -1728,6 +1842,10 @@ class TrueMemoryEngine:
             for rq in refined_queries:
                 try:
                     rq_results = self.search(rq, limit=limit, _skip_surprise_boost=True, _skip_reranker=True)
+                    logger.debug(
+                        "engine.search_agentic round2 refined_query=%r results_n=%d",
+                        rq[:80], len(rq_results),
+                    )
                     for rr in rq_results:
                         rid = rr.get("id")
                         if rid and rid not in existing_ids:
@@ -1761,6 +1879,12 @@ class TrueMemoryEngine:
         if use_reranker and self._has_reranker and len(primary_results) > 1:
             try:
                 from truememory.reranker import rerank_with_modality_fusion
+                logger.debug(
+                    "engine.search_agentic reranker_call pool=%d top_k=%d rrf_w=0.40 rerank_w=0.60 device=%r",
+                    len(primary_results[:limit * 5]),
+                    limit * 2 if (max_per_session > 0 or use_llm_reranker) else limit,
+                    reranker_device,
+                )
                 final_results = rerank_with_modality_fusion(
                     query, primary_results[:limit * 5],
                     top_k=limit * 2 if (max_per_session > 0 or use_llm_reranker) else limit,
@@ -1884,7 +2008,16 @@ class TrueMemoryEngine:
         if not results:
             return results
         alpha = self._get_alpha_surprise()
+        _alpha_src = (
+            "constructor" if getattr(self, "_alpha_surprise_override", None) is not None
+            else "env" if os.environ.get("TRUEMEMORY_ALPHA_SURPRISE") else "default"
+        )
+        logger.debug(
+            "engine._apply_surprise_boost alpha=%.4f alpha_src=%s",
+            alpha, _alpha_src,
+        )
         if alpha <= 0.0:
+            logger.debug("engine._apply_surprise_boost alpha=0 early_exit=True")
             return results  # exact no-op; identical order preserved
 
         # Collect message-backed row IDs. Non-message rows carry a
@@ -1899,6 +2032,11 @@ class TrueMemoryEngine:
         ]
         if not message_rows:
             return results
+        _blocked_rows = len(results) - len(message_rows)
+        logger.debug(
+            "engine._apply_surprise_boost eligible=%d blocked_by_source=%d",
+            len(message_rows), _blocked_rows,
+        )
 
         ids = [r["id"] for r in message_rows]
         surprise_map: dict[int, float] = {}
@@ -1913,6 +2051,10 @@ class TrueMemoryEngine:
                     chunk,
                 )
                 surprise_map.update(dict(cur.fetchall()))
+            logger.debug(
+                "engine._apply_surprise_boost surprise_map ids_with_score=%d total_eligible=%d",
+                len(surprise_map), len(ids),
+            )
         except sqlite3.OperationalError as exc:
             # Most likely surprise_scores table doesn't exist yet (cold
             # DB before first consolidate). Surface at WARNING once per
@@ -1930,15 +2072,35 @@ class TrueMemoryEngine:
             return results
 
         if not surprise_map:
+            logger.warning(
+                "engine._apply_surprise_boost empty_surprise_map eligible=%d "
+                "— build_surprise_index may never have run; call consolidate()",
+                len(ids),
+            )
             return results  # no scored messages; nothing to boost
 
         # Apply multiplicative boost on the canonical `score` field
         # that rerank_with_modality_fusion set to the fused_score.
+        _boosted_rows = 0
+        _max_mult = 1.0
         for r in message_rows:
             s = surprise_map.get(r["id"], 0.0)
             if s > 0.0:
                 base = r.get("score", r.get("rerank_score", r.get("rrf_score", 0.0)))
                 r["score"] = base * (1.0 + alpha * float(s))
+                logger.debug(
+                    "engine._apply_surprise_boost per_row id=%s base=%.4f surprise=%.4f boosted=%.4f",
+                    r["id"], base, s, r["score"],
+                )
+                _boosted_rows += 1
+                _mult = 1.0 + alpha * float(s)
+                if _mult > _max_mult:
+                    _max_mult = _mult
+
+        logger.debug(
+            "engine._apply_surprise_boost summary boosted_rows=%d max_multiplier=%.4f",
+            _boosted_rows, _max_mult,
+        )
 
         # Re-sort by the same canonical field.
         results = sorted(

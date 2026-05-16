@@ -23,12 +23,15 @@ Output: None (silent hook, no additionalContext)
 
 import argparse
 import json
+import logging
 import os
 import re
 import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 # Optional: fcntl isn't available on Windows, so we gracefully degrade
 try:
@@ -177,6 +180,10 @@ def main():
             interval = int(os.environ.get("TRUEMEMORY_INCREMENTAL_INTERVAL", "14400"))
             from truememory.ingest.hooks._shared import should_extract, mark_extracted
             if should_extract(interval):
+                log.info(
+                    "incremental: trigger fired session=%s interval=%ds transcript=%s",
+                    session_id, interval, transcript_path,
+                )
                 from truememory.ingest.hooks.stop import (
                     _has_enough_messages, _run_background_ingestion,
                     TRACE_DIR, LOG_DIR,
@@ -188,8 +195,21 @@ def main():
                         transcript_path, session_id, args.user, args.db,
                     )
                     mark_extracted()
+            else:
+                try:
+                    from truememory.ingest.hooks._shared import MARKER_PATH
+                    elapsed = time.time() - MARKER_PATH.stat().st_mtime if MARKER_PATH.exists() else 0.0
+                except OSError:
+                    elapsed = 0.0
+                log.debug(
+                    "incremental: skipped session=%s elapsed=%.0fs interval=%ds",
+                    session_id, elapsed, interval,
+                )
         except Exception:
-            pass  # Never crash the hook
+            log.exception(
+                "incremental: background ingestion failed session=%s transcript=%s",
+                session_id, transcript_path,
+            )
 
     recall_context = _try_auto_recall(prompt, args.user, args.db)
     if recall_context:

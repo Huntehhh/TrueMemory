@@ -186,8 +186,13 @@ def get_reranker(model_name: str | None = None, device: str | None = None):
             except ImportError:
                 device = "cpu"
 
+        _t_load = __import__("time").time()
         _model = CrossEncoder(name, device=device)
         _model_name = name
+        log.info(
+            "reranker.get_reranker model_loaded model=%s device=%s load_ms=%.0f",
+            name, device, (__import__("time").time() - _t_load) * 1000,
+        )
         return _model
 
 
@@ -212,6 +217,11 @@ def _normalize_and_fuse(
     orig_scores = [r.get("score", r.get("rrf_score", 0)) for r in reranked]
     orig_min, orig_max = min(orig_scores), max(orig_scores)
     orig_range = orig_max - orig_min if orig_max > orig_min else 1.0
+
+    log.debug(
+        "reranker._normalize_and_fuse rerank_range=[%.4f,%.4f] orig_range=[%.4f,%.4f] rrf_w=%.2f rerank_w=%.2f top_k=%d",
+        rr_min, rr_max, orig_min, orig_max, rrf_weight, rerank_weight, top_k,
+    )
 
     for r in reranked:
         norm_rerank = (r["rerank_score"] - rr_min) / rr_range
@@ -262,7 +272,14 @@ def rerank(
 
     # Score all pairs (locked for thread safety with parallel queries)
     with _inference_lock:
+        _t_pred = __import__("time").time()
         scores = model.predict(pairs, batch_size=batch_size, show_progress_bar=False)
+        _pred_ms = (__import__("time").time() - _t_pred) * 1000
+
+    log.debug(
+        "reranker.predict pair_count=%d batch_size=%d elapsed_ms=%.0f",
+        len(pairs), batch_size, _pred_ms,
+    )
 
     # Attach scores and sort
     scored = []
@@ -334,15 +351,23 @@ def rerank_with_modality_fusion(
     reranked = rerank(query, results, top_k=len(results), **kwargs)
     question_type = _classify_question_type(query)
 
+    _adjusted = 0
     for r in reranked:
         modality = r.get("modality", "conversation")
 
         if question_type == "detail":
             if modality in ("episode", "fact"):
                 r["rerank_score"] = r["rerank_score"] * 0.7
+                _adjusted += 1
         elif question_type == "synthesis":
             if modality in ("episode", "fact"):
                 r["rerank_score"] = r["rerank_score"] * 1.2
+                _adjusted += 1
+
+    log.debug(
+        "reranker.modality_fusion question_type=%s adjusted_rows=%d total_rows=%d",
+        question_type, _adjusted, len(reranked),
+    )
 
     return _normalize_and_fuse(reranked, rerank_weight, rrf_weight, top_k)
 

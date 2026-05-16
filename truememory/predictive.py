@@ -26,8 +26,11 @@ Key design decisions:
 All functions use only ``sqlite3`` and the Python standard library.
 """
 
+import logging
 import re
 import sqlite3
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -331,17 +334,24 @@ def build_surprise_index(conn: sqlite3.Connection) -> dict:
     _ensure_surprise_table(conn)
 
     # Clear existing scores for a clean rebuild
+    logger.info("build_surprise_index clearing existing scores before rebuild")
     conn.execute("DELETE FROM surprise_scores")
 
     # Fetch all messages in chronological order
     rows = conn.execute(
         "SELECT id, content, timestamp FROM messages ORDER BY timestamp, id"
     ).fetchall()
+    logger.info("build_surprise_index scoring n_messages=%d", len(rows))
 
     existing_facts: set[str] = set()
     scores: dict[int, float] = {}
 
     for msg_id, content, timestamp in rows:
+        if len(scores) > 0 and len(scores) % 500 == 0:
+            logger.debug(
+                "build_surprise_index progress scored=%d remaining=%d",
+                len(scores), len(rows) - len(scores),
+            )
         # Extract facts from this message
         message_facts = extract_facts(content)
         new_facts = message_facts - existing_facts
@@ -361,6 +371,14 @@ def build_surprise_index(conn: sqlite3.Connection) -> dict:
 
         # Add this message's facts to the accumulated set
         existing_facts.update(message_facts)
+
+    if scores:
+        mean_s = sum(scores.values()) / len(scores)
+        pct_high = sum(1 for s in scores.values() if s >= 0.5) / len(scores) * 100
+        logger.info(
+            "build_surprise_index complete scored=%d mean=%.4f pct_high=%.1f",
+            len(scores), mean_s, pct_high,
+        )
 
     conn.commit()
     return scores

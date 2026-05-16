@@ -25,13 +25,17 @@ Python standard library.
 
 import contextlib
 import json
+import logging
 import re
 import sqlite3
+import time
 import warnings
 from collections import defaultdict
 from datetime import datetime, timezone
 
 from truememory.fts_search import _build_safe_fts_query, _fts_search
+
+log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -1018,6 +1022,7 @@ def update_entity_profile_incremental(
 
     # ── Store ─────────────────────────────────────────────────────────
     now = datetime.now(timezone.utc).isoformat()
+    _t_store_start = time.time()
     conn.execute(
         """INSERT OR REPLACE INTO entity_profiles
            (entity, message_count, traits, communication_style,
@@ -1030,6 +1035,16 @@ def update_entity_profile_incremental(
         ),
     )
     conn.commit()
+    _store_ms = (time.time() - _t_store_start) * 1000
+    log.debug(
+        "entity_profile updated sender=%r msg_count=%d traits=%d store_ms=%.0f",
+        sender, msg_count, len(traits), _store_ms,
+    )
+    if _store_ms > 100:
+        log.warning(
+            "entity_profile slow_write sender=%r store_ms=%.0f msg_count=%d",
+            sender, _store_ms, msg_count,
+        )
 
 
 def get_entity_profile(conn: sqlite3.Connection,

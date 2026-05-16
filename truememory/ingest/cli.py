@@ -18,6 +18,8 @@ from pathlib import Path
 from truememory.ingest import ingest, save_trace, IngestionResult
 from truememory.ingest.models import LLMConfig, hydrate_config
 
+log = logging.getLogger(__name__)
+
 
 def main():
     os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
@@ -177,6 +179,10 @@ def _run_ingest(args):
         # model) so `--provider anthropic` works without forcing the user
         # to also pass `--model` and figure out how to inject a key.
         config = hydrate_config(LLMConfig(provider=args.provider, model=args.model))
+        log.info(
+            "ingest: llm_backend=%s model=%s (explicit --provider)",
+            config.provider, config.model,
+        )
         if not config.api_key and config.provider in ("anthropic", "openrouter", "openai"):
             print(
                 f"ERROR: --provider {config.provider} requires an API key.\n"
@@ -199,6 +205,14 @@ def _run_ingest(args):
                 )
                 sys.exit(3)
 
+    log.info(
+        "ingest: starting session=%s transcript=%s threshold=%.2f provider=%s",
+        args.session or "none",
+        args.transcript,
+        args.threshold,
+        config.provider if config else "auto",
+    )
+
     try:
         result = ingest(
             transcript_path=args.transcript,
@@ -212,6 +226,18 @@ def _run_ingest(args):
         # auto_detect raises RuntimeError when no LLM backend is available
         print(f"ERROR: {e}", file=sys.stderr)
         sys.exit(3)
+
+    log.info(
+        "ingest: complete session=%s stored=%d updated=%d skipped_gate=%d "
+        "skipped_dedup=%d extracted=%d elapsed=%.1fs",
+        args.session or "none",
+        result.facts_stored,
+        result.facts_updated,
+        result.facts_skipped_gate,
+        result.facts_skipped_dedup,
+        result.facts_extracted,
+        result.elapsed_seconds,
+    )
 
     _print_result(result)
 
