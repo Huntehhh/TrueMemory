@@ -193,6 +193,12 @@ class EncodingGate:
         # Normalized weights so the final score lands in [0, 1]
         total = w_novelty + w_salience + w_prediction_error
         self._norm = total if total > 0 else 1.0
+        log.debug(
+            "EncodingGate init threshold=%.2f w_nov=%.2f w_sal=%.2f w_pe=%.2f "
+            "floor=%.2f norm=%.2f user=%r",
+            self.threshold, self.w_novelty, self.w_salience, self.w_prediction_error,
+            self.salience_floor, self._norm, user_id,
+        )
         self._last_search_results: list[dict] = []
         self._embed_model = None
         self._batch_scores: list[float] = []
@@ -224,10 +230,19 @@ class EncodingGate:
         floored = salience < self.salience_floor
         if floored:
             should_encode = False
+            log.debug(
+                "gate_floor_reject fact=%r salience=%.3f floor=%.2f",
+                fact[:40], salience, self.salience_floor,
+            )
         else:
             cat = (category or "").strip().lower()
             effective_threshold = self.threshold + _CATEGORY_THRESHOLD_OVERRIDE.get(cat, 0.0)
             effective_threshold = max(0.10, effective_threshold)
+            if cat in _CATEGORY_THRESHOLD_OVERRIDE:
+                log.debug(
+                    "gate_category_override cat=%r delta=%.2f effective_thr=%.2f",
+                    cat, _CATEGORY_THRESHOLD_OVERRIDE[cat], effective_threshold,
+                )
             should_encode = score >= effective_threshold
         reason = self._explain(novelty, salience, pred_error, score, should_encode, floored)
 
@@ -337,6 +352,10 @@ class EncodingGate:
             # Values near 1+ mean the message is incompressible (novel)
             novelty = max(0.0, min(1.0, compression_cost))
 
+            log.debug(
+                "gate_novelty fact=%r c_fact=%d c_memory=%d cost=%.3f novelty=%.3f",
+                fact[:40], c_fact, c_memory, compression_cost, novelty,
+            )
             return max(0.05, novelty)
 
         except Exception as e:
@@ -452,6 +471,10 @@ class EncodingGate:
             pair_sim = float(np.dot(pair_emb, self_emb)) / (norm_p * norm_s)
 
             pe = max(0.0, min(1.0, 1.0 - pair_sim))
+            log.debug(
+                "gate_pe fact=%r sim=%.3f pair_sim=%.3f pe=%.3f",
+                fact[:40], sim, pair_sim, pe,
+            )
             return pe
 
         except Exception as e:

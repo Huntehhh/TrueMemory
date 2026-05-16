@@ -54,6 +54,28 @@ log = logging.getLogger(__name__)
 _TRUEMEMORY_DIR = Path.home() / ".truememory"
 _CONFIG_PATH = _TRUEMEMORY_DIR / "config.json"
 
+# ---------------------------------------------------------------------------
+# Diagnostic file logger — F41
+# ---------------------------------------------------------------------------
+# stderr from the MCP subprocess is swallowed by Claude Code's stdio plumbing,
+# so every hang/slow-path is invisible without an independent log channel.
+
+_DLOG_PATH = _TRUEMEMORY_DIR / "logs" / "mcp-debug.log"
+_DLOG_LOCK = threading.Lock()
+
+
+def _dlog(msg: str) -> None:
+    """Append a timestamped line to ~/.truememory/logs/mcp-debug.log. Never raises."""
+    try:
+        _DLOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with _DLOG_LOCK, open(_DLOG_PATH, "a", encoding="utf-8", errors="replace") as f:
+            f.write(
+                f"{time.strftime('%Y-%m-%d %H:%M:%S')}.{int(time.time() * 1000) % 1000:03d} "
+                f"pid={os.getpid()} tid={threading.get_ident()} {msg}\n"
+            )
+    except Exception:
+        pass
+
 
 def _load_config() -> dict:
     """Load persistent config from ~/.truememory/config.json.
@@ -73,6 +95,10 @@ def _load_config() -> dict:
         backup = _CONFIG_PATH.parent / f"{_CONFIG_PATH.name}.corrupt.{int(time.time())}"
         try:
             _CONFIG_PATH.rename(backup)
+            _dlog(
+                f"_load_config CORRUPT-RENAME {_CONFIG_PATH.name} -> {backup.name} "
+                f"(JSONDecodeError line={e.lineno} col={e.colno})"
+            )
             print(
                 f"truememory: config.json is corrupt (JSON parse error at "
                 f"line {e.lineno} col {e.colno}). Saved corrupt file to "
@@ -81,6 +107,7 @@ def _load_config() -> dict:
                 file=sys.stderr,
             )
         except OSError:
+            _dlog("_load_config CORRUPT-RENAME-FAILED OSError — backup impossible")
             print(
                 "truememory: config.json is corrupt and could not be "
                 "backed up. Run `truememory-mcp --setup` to recreate.",
@@ -188,9 +215,12 @@ def _get_memory() -> Memory:
     global _memory
     if _memory is not None:
         return _memory  # Fast path, no lock
+    _dlog("_get_memory cold path: acquiring lock + constructing Memory")
+    t0 = time.time()
     with _memory_lock:
         if _memory is None:
             _memory = Memory(path=_DB_PATH)
+        _dlog(f"_get_memory cold path done in {(time.time()-t0)*1000:.0f}ms")
         return _memory
 
 
@@ -514,18 +544,20 @@ def _parallel_search(queries, user_id, internal_limit, llm_fn, output_limit):
             )
 
     with ThreadPoolExecutor(max_workers=min(len(queries), 5)) as pool:
-        futures = [pool.submit(_run_query, q) for q in queries]
+        futures = [(q, pool.submit(_run_query, q)) for q in queries]
         merged = []
         seen_ids = set()
-        for f in futures:
+        for q, f in futures:
             try:
                 for r in f.result():
                     rid = r.get("id")
-                    if rid not in seen_ids:
+                    if rid is not None and rid not in seen_ids:
                         merged.append(r)
                         seen_ids.add(rid)
-            except Exception:
-                pass  # Individual query failure doesn't kill the batch
+            except Exception as e:
+                # GAP-X01: was a bare pass. Silently drops all results from
+                # failing workers in a parallel batch — now surfaced to dlog.
+                _dlog(f"parallel_search query={q[:60]!r} FAILED {type(e).__name__}: {e}")
 
     merged.sort(key=lambda x: -x.get("score", 0))
     return merged[:output_limit]
@@ -551,24 +583,41 @@ async def truememory_store(
         user_id: Owner of this memory (e.g. a person's name).
         metadata: Optional JSON string of metadata.
     """
+    t0 = time.time()
+    preview = (content or "")[:60].replace("\n", " ")
+    _dlog(f"store ENTER user_id={user_id!r} content[:60]={preview!r}")
     _touch_search_time()
     MAX_CONTENT_LENGTH = 50_000
     if len(content) > MAX_CONTENT_LENGTH:
+        _dlog(
+            f"store EARLY-EXIT content_too_large len={len(content)} "
+            f"limit={MAX_CONTENT_LENGTH} user_id={user_id!r}"
+        )
         return json.dumps({"error": f"Content too large ({len(content)} chars). Maximum is {MAX_CONTENT_LENGTH}."})
     MAX_METADATA_LENGTH = 10_000
     if metadata and len(metadata) > MAX_METADATA_LENGTH:
         return json.dumps({"error": f"Metadata too large ({len(metadata)} chars). Maximum is {MAX_METADATA_LENGTH}."})
-    m = _get_memory()
     try:
-        meta = json.loads(metadata) if metadata else None
-    except (json.JSONDecodeError, ValueError):
-        meta = None
-    # Run engine.add in a thread so the FastMCP event loop stays free to
-    # accept concurrent JSON-RPC requests (fixes parallel-store hang).
-    result = await asyncio.to_thread(
-        m.add, content=content, user_id=user_id or None, metadata=meta
-    )
-    return json.dumps(result, indent=2)
+        t_get = time.time()
+        m = _get_memory()
+        _dlog(f"store _get_memory done in {(time.time()-t_get)*1000:.0f}ms")
+        try:
+            meta = json.loads(metadata) if metadata else None
+        except (json.JSONDecodeError, ValueError):
+            meta = None
+        # Run engine.add in a thread so the FastMCP event loop stays free to
+        # accept concurrent JSON-RPC requests (fixes parallel-store hang).
+        t_add = time.time()
+        result = await asyncio.to_thread(
+            m.add, content=content, user_id=user_id or None, metadata=meta
+        )
+        _dlog(f"store m.add() done in {(time.time()-t_add)*1000:.0f}ms id={result.get('id')}")
+        out = json.dumps(result, indent=2)
+        _dlog(f"store EXIT total {(time.time()-t0)*1000:.0f}ms")
+        return out
+    except Exception as e:
+        _dlog(f"store ERROR after {(time.time()-t0)*1000:.0f}ms: {type(e).__name__}: {e}")
+        raise
 
 
 @mcp.tool()
@@ -635,13 +684,23 @@ async def truememory_search(
     if not queries_to_run:
         return json.dumps([])
 
+    t0 = time.time()
+    _dlog(
+        f"search ENTER query={queries_to_run[0][:60]!r} "
+        f"queries={len(queries_to_run)} limit={limit} user_id={user_id!r}"
+    )
     _set_reranker(_current_reranker())
     llm_fn = _get_llm_fn()
+    _dlog(
+        f"search reranker+llm resolved in {(time.time()-t0)*1000:.0f}ms "
+        f"llm={'yes' if llm_fn else 'no'}"
+    )
     uid = user_id or None
 
     try:
         if len(queries_to_run) == 1:
             m = _get_memory()
+            t_search = time.time()
             results = await asyncio.wait_for(
                 asyncio.to_thread(
                     m.search_deep,
@@ -650,8 +709,24 @@ async def truememory_search(
                 ),
                 timeout=_SEARCH_TIMEOUT_S,
             )
-            return json.dumps(results[:limit], indent=2)
+            _dlog(
+                f"search single-query done in {(time.time()-t_search)*1000:.0f}ms "
+                f"raw_results={len(results)}"
+            )
+            out = results[:limit]
+            top = out[0].get("score", 0) if out else 0
+            for rank, r in enumerate(out, 1):
+                _dlog(
+                    f"memory_returned tool=search memory_id={r.get('id')} "
+                    f"rank={rank} score={r.get('score', 0):.4f}"
+                )
+            _dlog(
+                f"search EXIT total {(time.time()-t0)*1000:.0f}ms "
+                f"returned={len(out)} top_score={top:.4f}"
+            )
+            return json.dumps(out, indent=2)
 
+        t_search = time.time()
         results = await asyncio.wait_for(
             asyncio.to_thread(
                 _parallel_search, queries_to_run, uid,
@@ -659,8 +734,23 @@ async def truememory_search(
             ),
             timeout=_SEARCH_TIMEOUT_S,
         )
+        _dlog(
+            f"search parallel done in {(time.time()-t_search)*1000:.0f}ms "
+            f"merged_results={len(results)}"
+        )
+        top = results[0].get("score", 0) if results else 0
+        for rank, r in enumerate(results, 1):
+            _dlog(
+                f"memory_returned tool=search memory_id={r.get('id')} "
+                f"rank={rank} score={r.get('score', 0):.4f}"
+            )
+        _dlog(
+            f"search EXIT total {(time.time()-t0)*1000:.0f}ms "
+            f"returned={len(results)} top_score={top:.4f}"
+        )
         return json.dumps(results, indent=2)
     except asyncio.TimeoutError:
+        _dlog(f"search TIMEOUT after {_SEARCH_TIMEOUT_S:.0f}s queries={len(queries_to_run)}")
         log.error(
             "truememory_search exceeded %.0fs timeout — aborting. queries=%d",
             _SEARCH_TIMEOUT_S, len(queries_to_run),
@@ -730,13 +820,24 @@ async def truememory_search_deep(
     if not queries_to_run:
         return json.dumps([])
 
+    t0 = time.time()
+    _dlog(
+        f"search_deep ENTER query={queries_to_run[0][:60]!r} "
+        f"queries={len(queries_to_run)} limit={limit} "
+        f"internal_limit={_DEEP_INTERNAL_LIMIT} user_id={user_id!r}"
+    )
     _set_reranker(_DEEP_RERANKER)
     llm_fn = _get_llm_fn()
+    _dlog(
+        f"search_deep reranker+llm resolved in {(time.time()-t0)*1000:.0f}ms "
+        f"llm={'yes' if llm_fn else 'no'}"
+    )
     uid = user_id or None
 
     try:
         if len(queries_to_run) == 1:
             m = _get_memory()
+            t_search = time.time()
             results = await asyncio.wait_for(
                 asyncio.to_thread(
                     m.search_deep,
@@ -745,8 +846,24 @@ async def truememory_search_deep(
                 ),
                 timeout=_SEARCH_TIMEOUT_S,
             )
-            return json.dumps(results[:limit], indent=2)
+            _dlog(
+                f"search_deep single-query done in {(time.time()-t_search)*1000:.0f}ms "
+                f"raw_results={len(results)}"
+            )
+            out = results[:limit]
+            top = out[0].get("score", 0) if out else 0
+            for rank, r in enumerate(out, 1):
+                _dlog(
+                    f"memory_returned tool=search_deep memory_id={r.get('id')} "
+                    f"rank={rank} score={r.get('score', 0):.4f}"
+                )
+            _dlog(
+                f"search_deep EXIT total {(time.time()-t0)*1000:.0f}ms "
+                f"returned={len(out)} top_score={top:.4f}"
+            )
+            return json.dumps(out, indent=2)
 
+        t_search = time.time()
         results = await asyncio.wait_for(
             asyncio.to_thread(
                 _parallel_search, queries_to_run, uid,
@@ -754,8 +871,23 @@ async def truememory_search_deep(
             ),
             timeout=_SEARCH_TIMEOUT_S,
         )
+        _dlog(
+            f"search_deep parallel done in {(time.time()-t_search)*1000:.0f}ms "
+            f"merged_results={len(results)}"
+        )
+        top = results[0].get("score", 0) if results else 0
+        for rank, r in enumerate(results, 1):
+            _dlog(
+                f"memory_returned tool=search_deep memory_id={r.get('id')} "
+                f"rank={rank} score={r.get('score', 0):.4f}"
+            )
+        _dlog(
+            f"search_deep EXIT total {(time.time()-t0)*1000:.0f}ms "
+            f"returned={len(results)} top_score={top:.4f}"
+        )
         return json.dumps(results, indent=2)
     except asyncio.TimeoutError:
+        _dlog(f"search_deep TIMEOUT after {_SEARCH_TIMEOUT_S:.0f}s queries={len(queries_to_run)}")
         log.error(
             "truememory_search_deep exceeded %.0fs timeout — aborting. queries=%d",
             _SEARCH_TIMEOUT_S, len(queries_to_run),
@@ -774,11 +906,26 @@ async def truememory_get(memory_id: int) -> str:
     Args:
         memory_id: The integer ID of the memory to retrieve.
     """
-    m = _get_memory()
-    result = await asyncio.to_thread(m.get, memory_id)
-    if result is None:
-        return json.dumps({"error": f"Memory {memory_id} not found"})
-    return json.dumps(result, indent=2)
+    t0 = time.time()
+    _dlog(f"get ENTER memory_id={memory_id}")
+    try:
+        m = _get_memory()
+        result = await asyncio.to_thread(m.get, memory_id)
+        if result is None:
+            _dlog(f"get EXIT not-found memory_id={memory_id} total {(time.time()-t0)*1000:.0f}ms")
+            return json.dumps({"error": f"Memory {memory_id} not found"})
+        preview = str(result.get("content", ""))[:40].replace("\n", " ")
+        _dlog(
+            f"get EXIT found memory_id={memory_id} content[:40]={preview!r} "
+            f"total {(time.time()-t0)*1000:.0f}ms"
+        )
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        _dlog(
+            f"get ERROR after {(time.time()-t0)*1000:.0f}ms "
+            f"memory_id={memory_id}: {type(e).__name__}: {e}"
+        )
+        raise
 
 
 @mcp.tool()
@@ -789,9 +936,22 @@ async def truememory_forget(memory_id: int) -> str:
     Args:
         memory_id: The integer ID of the memory to delete.
     """
-    m = _get_memory()
-    deleted = await asyncio.to_thread(m.delete, memory_id)
-    return json.dumps({"deleted": deleted, "memory_id": memory_id})
+    t0 = time.time()
+    _dlog(f"forget ENTER memory_id={memory_id}")
+    try:
+        m = _get_memory()
+        deleted = await asyncio.to_thread(m.delete, memory_id)
+        _dlog(
+            f"forget EXIT memory_id={memory_id} deleted={deleted} "
+            f"total {(time.time()-t0)*1000:.0f}ms"
+        )
+        return json.dumps({"deleted": deleted, "memory_id": memory_id})
+    except Exception as e:
+        _dlog(
+            f"forget ERROR after {(time.time()-t0)*1000:.0f}ms "
+            f"memory_id={memory_id}: {type(e).__name__}: {e}"
+        )
+        raise
 
 
 @mcp.tool()
@@ -800,6 +960,8 @@ async def truememory_stats() -> str:
     """Get memory system statistics. On first run, returns a welcome message
     and setup instructions — present these to the user to walk them through
     choosing Edge, Base, or Pro tier."""
+    t0 = time.time()
+    _dlog("stats ENTER")
     m = _get_memory()
     # Stats touches the DB (ensure_connection + COUNT queries) — run in a
     # thread so the event loop stays free for other MCP requests.
@@ -815,6 +977,15 @@ async def truememory_stats() -> str:
     stats["rss_mb"] = round(_get_rss_mb(), 1)
     if _MAX_RSS_MB:
         stats["max_rss_mb"] = _MAX_RSS_MB
+
+    health = stats["health"]
+    degraded = [k for k, v in health.items() if isinstance(v, dict) and v.get("status") == "degraded"]
+    _dlog(
+        f"stats EXIT message_count={stats.get('message_count', '?')} "
+        f"tier={stats.get('tier', '?')} rss_mb={stats['rss_mb']} "
+        f"degraded={degraded if degraded else 'none'} "
+        f"total {(time.time()-t0)*1000:.0f}ms"
+    )
 
     if not stats["tier_configured"]:
         stats["setup_required"] = True
@@ -881,14 +1052,22 @@ def truememory_configure(
     if tier not in ("edge", "base", "pro"):
         return json.dumps({"error": "tier must be 'edge', 'base', or 'pro'"})
 
+    t0 = time.time()
+    _dlog(
+        f"configure ENTER tier={tier!r} api_provider={api_provider!r} "
+        f"has_key={bool(api_key)} has_email={bool(email)}"
+    )
+
     # Validate API key + provider pairing
     if api_key and not api_provider:
+        _dlog("configure EXIT early: api_key without api_provider")
         return json.dumps({
             "error": "api_provider is required when api_key is provided. Use: anthropic, openrouter, or openai",
         })
     if api_provider:
         api_provider = api_provider.lower().strip()
         if api_provider not in ("anthropic", "openrouter", "openai"):
+            _dlog(f"configure EXIT early: invalid api_provider={api_provider!r}")
             return json.dumps({
                 "error": "api_provider must be one of: anthropic, openrouter, openai",
             })
@@ -942,6 +1121,8 @@ def truememory_configure(
     rebuild_error: str | None = None
     os.environ.pop("HF_HUB_OFFLINE", None)
     os.environ.pop("TRANSFORMERS_OFFLINE", None)
+    if old_tier != tier:
+        _dlog(f"configure going-online for tier switch {old_tier!r}->{tier!r} (HF_HUB_OFFLINE popped)")
     try:
         os.environ["TRUEMEMORY_EMBED_MODEL"] = tier
         from truememory.vector_search import set_embedding_model
@@ -970,6 +1151,8 @@ def truememory_configure(
                 conn = engine.conn
                 count = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
                 if count > 0:
+                    t_embed = time.time()
+                    _dlog(f"configure re-embed START count={count} {old_tier!r}->{tier!r}")
                     conn.execute("DROP TABLE IF EXISTS vec_messages")
                     conn.execute("DROP TABLE IF EXISTS vec_messages_sep")
                     conn.commit()
@@ -982,8 +1165,10 @@ def truememory_configure(
                     build_vectors(conn)
                     build_separation_vectors(conn)
                     rebuilt = True
+                    _dlog(f"configure re-embed DONE in {(time.time()-t_embed)*1000:.0f}ms count={count}")
             except Exception as e:
                 rebuild_error = f"{type(e).__name__}: {e}"
+                _dlog(f"configure re-embed ERROR: {rebuild_error}")
                 log.exception("truememory_configure re-embed failed")
             finally:
                 with _memory_lock:
@@ -991,8 +1176,14 @@ def truememory_configure(
     finally:
         # Always restore offline mode, even if set_embedding_model or the
         # rebuild block raised before we got to their own cleanup.
+        _dlog("configure offline-mode restored (HF_HUB_OFFLINE=1)")
         os.environ["HF_HUB_OFFLINE"] = "1"
         os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
+    _dlog(
+        f"configure EXIT total {(time.time()-t0)*1000:.0f}ms "
+        f"tier={tier!r} rebuilt={rebuilt} rebuild_error={rebuild_error!r}"
+    )
 
     # Build result with onboarding info
     _tier_descriptions = {
@@ -1072,6 +1263,8 @@ async def truememory_entity_profile(entity: str) -> str:
     Args:
         entity: Name of the person/entity to look up.
     """
+    t0 = time.time()
+    _dlog(f"entity_profile ENTER entity={entity!r}")
     m = _get_memory()
 
     def _lookup():
@@ -1080,9 +1273,25 @@ async def truememory_entity_profile(entity: str) -> str:
             from truememory.personality import get_entity_profile
             profile = get_entity_profile(m._engine.conn, entity)
             if profile:
+                keys = list(profile.keys()) if isinstance(profile, dict) else []
+                _dlog(
+                    f"entity_profile found entity={entity!r} keys={keys} "
+                    f"total {(time.time()-t0)*1000:.0f}ms"
+                )
                 return json.dumps(profile, indent=2, default=str)
+            _dlog(f"entity_profile not-found entity={entity!r} total {(time.time()-t0)*1000:.0f}ms")
             return json.dumps({"error": f"No profile found for '{entity}'"})
+        except ImportError as e:
+            _dlog(
+                f"entity_profile IMPORT-ERROR entity={entity!r}: {e} "
+                f"total {(time.time()-t0)*1000:.0f}ms"
+            )
+            return json.dumps({"error": f"personality module unavailable: {e}"})
         except Exception as e:
+            _dlog(
+                f"entity_profile ERROR entity={entity!r}: {type(e).__name__}: {e} "
+                f"total {(time.time()-t0)*1000:.0f}ms"
+            )
             return json.dumps({"error": str(e)})
 
     return await asyncio.to_thread(_lookup)
@@ -1112,21 +1321,28 @@ def _unload_models() -> None:
     try:
         from truememory.vector_search import unload_model
         unload_model()
-    except Exception:
-        pass
+    except Exception as e:
+        _dlog(f"_unload_models vector_search.unload_model FAILED: {type(e).__name__}: {e}")
     try:
         from truememory.reranker import unload_reranker
         unload_reranker()
-    except Exception:
-        pass
+    except Exception as e:
+        _dlog(f"_unload_models reranker.unload_reranker FAILED: {type(e).__name__}: {e}")
     gc.collect()
-    log.info("Models unloaded (idle timeout). RSS=%.0f MB", _get_rss_mb())
+    rss_after = _get_rss_mb()
+    _dlog(f"_unload_models DONE rss_after={rss_after:.0f}MB")
+    log.info("Models unloaded (idle timeout). RSS=%.0f MB", rss_after)
 
 
 def _check_idle_unload() -> None:
     global _idle_timer
     elapsed = time.monotonic() - _last_search_time
-    if _last_search_time > 0 and elapsed >= _MODEL_IDLE_TIMEOUT_SEC:
+    will_unload = _last_search_time > 0 and elapsed >= _MODEL_IDLE_TIMEOUT_SEC
+    _dlog(
+        f"_check_idle_unload TIMER-FIRED elapsed={elapsed:.0f}s "
+        f"threshold={_MODEL_IDLE_TIMEOUT_SEC}s will_unload={will_unload}"
+    )
+    if will_unload:
         _unload_models()
     with _idle_timer_lock:
         _idle_timer = None
@@ -1155,22 +1371,28 @@ def _preload_models():
         return
 
     def _load_embedding_model_and_db():
+        t_pre = time.time()
+        _dlog("_preload_models t1-embedding ENTER")
         try:
             from truememory.vector_search import get_model
             get_model()
-        except Exception:
-            pass
+        except Exception as e:
+            _dlog(f"_preload_models t1-embedding get_model FAILED: {type(e).__name__}: {e}")
         try:
             _get_memory()
-        except Exception:
-            pass
+        except Exception as e:
+            _dlog(f"_preload_models t1-embedding _get_memory FAILED: {type(e).__name__}: {e}")
+        _dlog(f"_preload_models t1-embedding DONE in {(time.time()-t_pre)*1000:.0f}ms")
 
     def _load_reranker():
+        t_pre = time.time()
+        _dlog("_preload_models t2-reranker ENTER")
         try:
             from truememory.reranker import get_reranker
             get_reranker(model_name=_current_reranker())
-        except Exception:
-            pass
+        except Exception as e:
+            _dlog(f"_preload_models t2-reranker get_reranker FAILED: {type(e).__name__}: {e}")
+        _dlog(f"_preload_models t2-reranker DONE in {(time.time()-t_pre)*1000:.0f}ms")
 
     t1 = threading.Thread(target=_load_embedding_model_and_db, daemon=True)
     t2 = threading.Thread(target=_load_reranker, daemon=True)
@@ -1197,6 +1419,8 @@ def _backlog_drainer() -> None:
     import time as _time
     _time.sleep(10)
 
+    _dlog("_backlog_drainer loop STARTED (after 10s initial delay)")
+
     while True:
         try:
             _reap_children()
@@ -1205,10 +1429,14 @@ def _backlog_drainer() -> None:
                 markers = sorted(_BACKLOG_DIR.glob("*.json"))
                 backlog_count = len(markers)
                 if markers:
+                    _dlog(f"_backlog_drainer TICK backlog_count={backlog_count}")
                     _drain_batch_from_backlog(markers)
-        except Exception:
-            pass
+                else:
+                    _dlog("_backlog_drainer TICK backlog_count=0 (dir absent or empty)")
+        except Exception as e:
+            _dlog(f"_backlog_drainer LOOP-ERROR {type(e).__name__}: {e}")
         interval = _BACKLOG_DRAIN_INTERVAL_NORMAL if backlog_count > _BACKLOG_LARGE_THRESHOLD else _BACKLOG_DRAIN_INTERVAL_IDLE
+        _dlog(f"_backlog_drainer sleeping interval={interval}s next_tick")
         _time.sleep(interval)
 
 
@@ -1263,11 +1491,12 @@ def _drain_batch_from_backlog(markers: list[Path]) -> None:
                     start_new_session=True,
                 )
                 register_spawned_pid(proc.pid)
+                _dlog(f"_drain_batch spawned pid={proc.pid} session={data.get('session_id', '?')!r}")
 
             marker_path.unlink(missing_ok=True)
             log.info("Backlog drainer: processed session %s", data.get("session_id", "?"))
-        except Exception:
-            pass
+        except Exception as e:
+            _dlog(f"_drain_batch ITEM-ERROR marker={marker_path.name!r}: {type(e).__name__}: {e}")
 
 
 def _start_backlog_drainer() -> None:
@@ -1275,6 +1504,11 @@ def _start_backlog_drainer() -> None:
     if _BACKLOG_DRAIN_INTERVAL_NORMAL <= 0:
         log.info("Backlog drainer disabled (TRUEMEMORY_DRAIN_INTERVAL_SEC=0)")
         return
+    _dlog(
+        f"_start_backlog_drainer STARTED "
+        f"interval_normal={_BACKLOG_DRAIN_INTERVAL_NORMAL}s "
+        f"interval_idle={_BACKLOG_DRAIN_INTERVAL_IDLE}s"
+    )
     t = threading.Thread(target=_backlog_drainer, daemon=True, name="backlog-drainer")
     t.start()
     log.info("Backlog drainer started (interval=%ds)", _BACKLOG_DRAIN_INTERVAL_NORMAL)
@@ -1557,10 +1791,26 @@ def main():
     except Exception:
         pass
 
+    _dlog(f"=== mcp_server startup pid={os.getpid()} python={sys.executable!r} argv={sys.argv!r} ===")
+    _dlog(
+        f"HF_HUB_OFFLINE={os.environ.get('HF_HUB_OFFLINE')!r} "
+        f"TRANSFORMERS_OFFLINE={os.environ.get('TRANSFORMERS_OFFLINE')!r}"
+    )
+
+    # GAP-X04: log client identity hint for connection tracing.
+    client_hint = (
+        os.environ.get("MCP_CLIENT_NAME")
+        or os.environ.get("CLAUDE_CODE_SESSION_ID")
+        or os.environ.get("TERM_PROGRAM")
+        or "unknown"
+    )
+    _dlog(f"mcp_client_connect pid={os.getpid()} argv0={sys.argv[0]!r} client_hint={client_hint!r}")
+
     # Kick off model preloading before entering the event loop. Models
     # load in background threads (~2.5s) while the MCP handshake
     # completes (~1-3s), so the first search arrives with warm models.
     _preload_models()
+    _dlog("preload kicked off, entering mcp.run() stdio loop")
 
     # Start background backlog drainer — processes queued session
     # transcripts every 60s while the MCP server is alive, respecting
@@ -1574,8 +1824,11 @@ def main():
     # os._exit(0) bypasses teardown entirely. SQLite WAL handles this safely.
     try:
         mcp.run(transport="stdio")
-    except (BrokenPipeError, EOFError, KeyboardInterrupt):
-        pass
+        _dlog(f"=== mcp.run returned cleanly (pid={os.getpid()}) ===")
+    except (BrokenPipeError, EOFError, KeyboardInterrupt) as e:
+        _dlog(f"=== mcp.run exited via {type(e).__name__} (pid={os.getpid()}) ===")
+    except BaseException as e:
+        _dlog(f"=== mcp.run unexpected exception {type(e).__name__}: {e} (pid={os.getpid()}) ===")
     finally:
         # Flush remaining telemetry events before exit
         try:
@@ -1587,8 +1840,10 @@ def main():
         if _memory is not None:
             try:
                 _memory._engine.conn.close()
-            except Exception:
-                pass
+                _dlog("_memory connection closed")
+            except Exception as e:
+                _dlog(f"_memory close failed: {type(e).__name__}: {e}")
+        _dlog(f"=== EXIT via os._exit(0) (pid={os.getpid()}) ===")
         os._exit(0)
 
 

@@ -281,9 +281,20 @@ def _complete_openai_compat(config: LLMConfig, prompt: str, system: str) -> str:
         raise LLMError(f"Invalid JSON from {config.provider}: {e}") from e
 
     try:
-        return data["choices"][0]["message"]["content"]
+        content = data["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError) as e:
         raise LLMError(f"Unexpected response shape from {config.provider}: {data}") from e
+
+    usage = data.get("usage", {})
+    if usage:
+        log.info(
+            "llm_tokens provider=%s model=%s prompt_tokens=%d completion_tokens=%d total_tokens=%d",
+            config.provider, config.model,
+            usage.get("prompt_tokens", 0),
+            usage.get("completion_tokens", 0),
+            usage.get("total_tokens", 0),
+        )
+    return content
 
 
 # ---------------------------------------------------------------------------
@@ -352,9 +363,19 @@ def _complete_anthropic(config: LLMConfig, prompt: str, system: str) -> str:
         raise LLMError(f"Anthropic returned invalid JSON: {e}") from e
 
     try:
-        return data["content"][0]["text"]
+        content = data["content"][0]["text"]
     except (KeyError, IndexError, TypeError) as e:
         raise LLMError(f"Unexpected Anthropic response shape: {data}") from e
+
+    usage = data.get("usage", {})
+    if usage:
+        log.info(
+            "llm_tokens provider=anthropic model=%s input_tokens=%d output_tokens=%d",
+            config.model,
+            usage.get("input_tokens", 0),
+            usage.get("output_tokens", 0),
+        )
+    return content
 
 
 # ---------------------------------------------------------------------------
@@ -400,6 +421,7 @@ def _complete_claude_cli(config: LLMConfig, prompt: str, system: str) -> str:
     # than a potentially stale key from the parent environment.
     env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
 
+    _t_cli_start = time.time()
     try:
         proc = subprocess.run(
             cmd,
@@ -416,6 +438,12 @@ def _complete_claude_cli(config: LLMConfig, prompt: str, system: str) -> str:
         raise LLMError("claude CLI timed out after 120s") from e
     except OSError as e:
         raise LLMError(f"claude CLI invocation failed: {e}") from e
+
+    _cli_elapsed = time.time() - _t_cli_start
+    log.info(
+        "claude_cli: returncode=%d elapsed=%.1fs model=%s",
+        proc.returncode, _cli_elapsed, config.model or "default",
+    )
 
     if proc.returncode != 0:
         stderr = (proc.stderr or "").strip()[:500]

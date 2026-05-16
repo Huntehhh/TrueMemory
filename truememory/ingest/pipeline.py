@@ -42,6 +42,25 @@ from truememory.ingest.models import LLMConfig, auto_detect
 log = logging.getLogger(__name__)
 
 
+def _classify_reason(reason_str: str) -> str:
+    """Map a gate reason string to a stable enum token for dashboard aggregation.
+
+    The dashboard groups gate rejects by reason_code to show which signal
+    is the primary blocker. Never change these enum values without a
+    corresponding dashboard migration — they appear in log grep queries.
+    """
+    r = (reason_str or "").lower()
+    if "floor" in r or "salience below" in r:
+        return "salience_floor"
+    if "familiar" in r or ("novelty" in r and ("low" in r or "0." in r)):
+        return "novelty_too_low"
+    if "low salience" in r:
+        return "salience_floor"
+    if "prediction error" in r or "pred_error" in r:
+        return "pred_error_low"
+    return "combined_below_threshold"
+
+
 # Optional: fcntl for cross-process locking of the dedup-store critical
 # section. On Windows fcntl is unavailable — we fall back to a no-op lock
 # there (best-effort; sqlite's busy_timeout still protects writes).
@@ -308,10 +327,31 @@ class IngestionPipeline:
                 result.facts_skipped_gate += 1
                 trace_entry["action"] = "skipped_gate"
                 result.trace.append(trace_entry)
-                log.debug("Gate blocked: %s — %s", fact.content[:50], decision.reason)
+                log.info(
+                    "gate: event=reject reason_code=%s score=%.3f novelty=%.2f "
+                    "salience=%.2f pred_error=%.2f fact=%r session=%s",
+                    _classify_reason(decision.reason),
+                    decision.encoding_score,
+                    decision.novelty,
+                    decision.salience,
+                    decision.prediction_error,
+                    fact.content[:40],
+                    session_id,
+                )
                 continue
 
             result.facts_encoded += 1
+            log.info(
+                "gate: event=pass score=%.3f novelty=%.2f salience=%.2f "
+                "pred_error=%.2f category=%s fact=%r session=%s",
+                decision.encoding_score,
+                decision.novelty,
+                decision.salience,
+                decision.prediction_error,
+                fact.category,
+                fact.content[:40],
+                session_id,
+            )
 
             # 4-5. Deduplication + storage (atomic critical section).
             #
@@ -322,12 +362,14 @@ class IngestionPipeline:
             # this lock, concurrent Stop hooks from overlapping Claude Code
             # sessions accumulate near-duplicate memories.
             with _dedup_store_lock():
+                _t_dedup_start = time.time()
                 dedup = check_duplicate(
                     fact.content,
                     self.memory,
                     user_id=self.user_id,
                     config=self.llm_config if self.use_llm_dedup else None,
                 )
+                _t_dedup_ms = (time.time() - _t_dedup_start) * 1000
                 trace_entry["dedup"] = {
                     "action": dedup.action.value,
                     "reason": dedup.reason,
@@ -359,7 +401,10 @@ class IngestionPipeline:
                     else:
                         result.facts_stored += 1
                         trace_entry["action"] = "stored"
-                        log.info("Stored: %s", dedup.fact[:80])
+                        log.info(
+                            "stored: fact=%r session=%s dedup_ms=%.0f",
+                            dedup.fact[:60], session_id, _t_dedup_ms,
+                        )
 
                 elif dedup.action == DedupAction.UPDATE:
                     try:
@@ -380,12 +425,22 @@ class IngestionPipeline:
                     else:
                         result.facts_updated += 1
                         trace_entry["action"] = "updated"
-                        log.info("Updated [%s]: %s", dedup.existing_id, dedup.fact[:80])
+                        log.info(
+                            "updated: id=%s fact=%r existing=%r session=%s dedup_ms=%.0f",
+                            dedup.existing_id,
+                            dedup.fact[:40],
+                            dedup.existing_content[:40],
+                            session_id,
+                            _t_dedup_ms,
+                        )
 
                 elif dedup.action == DedupAction.SKIP:
                     result.facts_skipped_dedup += 1
                     trace_entry["action"] = "skipped_dedup"
-                    log.debug("Dedup skipped: %s — %s", fact.content[:50], dedup.reason)
+                    log.info(
+                        "dedup: event=skip fact=%r reason=%s session=%s dedup_ms=%.0f",
+                        fact.content[:40], dedup.reason, session_id, _t_dedup_ms,
+                    )
 
             result.trace.append(trace_entry)
 
@@ -397,6 +452,25 @@ class IngestionPipeline:
             result.facts_skipped_gate, result.facts_skipped_dedup,
             result.elapsed_seconds,
         )
+
+        # Call gate batch summary (was dead code — never invoked before).
+        batch = self.gate.log_batch_summary()
+        evaluated = batch.get("evaluated", 0)
+        passed = batch.get("passed", 0)
+        blocked = batch.get("blocked", 0)
+        pass_rate = (passed / evaluated) if evaluated > 0 else 0.0
+        log.info(
+            "gate_batch session=%s evaluated=%d passed=%d blocked=%d "
+            "pass_rate=%.3f score_min=%.3f score_max=%.3f top_reject=unknown",
+            session_id,
+            evaluated,
+            passed,
+            blocked,
+            pass_rate,
+            batch.get("score_min", 0.0),
+            batch.get("score_max", 0.0),
+        )
+
         return result
 
     def ingest_text(self, text: str, session_id: str = "") -> IngestionResult:
@@ -473,6 +547,17 @@ class IngestionPipeline:
                     result.facts_skipped_dedup += 1
 
         result.elapsed_seconds = round(time.time() - start, 2)
+        log.info(
+            "ingest_text: complete session=%s extracted=%d stored=%d updated=%d "
+            "skipped_gate=%d skipped_dedup=%d elapsed=%.1fs",
+            session_id,
+            result.facts_extracted,
+            result.facts_stored,
+            result.facts_updated,
+            result.facts_skipped_gate,
+            result.facts_skipped_dedup,
+            result.elapsed_seconds,
+        )
         return result
 
     def _store_fact(

@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass
 
 from truememory.ingest.models import LLMConfig, LLMError, complete
@@ -215,8 +216,14 @@ def extract_facts(
     all_facts: list[ExtractedFact] = []
     for i, chunk in enumerate(chunks):
         prompt = EXTRACTION_PROMPT.format(transcript=chunk)
+        _t_chunk_start = time.time()
         try:
             response = complete(config, prompt, system=EXTRACTION_SYSTEM)
+            _chunk_elapsed = time.time() - _t_chunk_start
+            log.info(
+                "LLM chunk %d/%d done in %.1fs provider=%s model=%s",
+                i + 1, len(chunks), _chunk_elapsed, config.provider, config.model,
+            )
         except LLMError as e:
             log.error(
                 "LLM extraction failed for chunk %d/%d (%s): %s",
@@ -282,7 +289,12 @@ def _parse_extraction_response(response: str, max_facts: int) -> list[ExtractedF
         facts_data = json.loads(json_str)
     except json.JSONDecodeError as e:
         log.warning("Failed to parse extraction JSON: %s", e)
-        return _salvage_partial_json(json_str)
+        result = _salvage_partial_json(json_str)
+        log.warning(
+            "LLM returned malformed JSON; salvaged %d facts (parse_error=%s)",
+            len(result), e,
+        )
+        return result
 
     # Unwrap common object wrappers: {"facts": [...]}, {"items": [...]}
     if isinstance(facts_data, dict):

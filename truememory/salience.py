@@ -377,6 +377,10 @@ def filter_by_salience(
         r["salience"] = salience
         if salience >= min_salience:
             filtered.append(r)
+    _log.debug(
+        "salience.filter_by_salience in=%d out=%d min_sal=%.4f removed=%d",
+        len(results), len(filtered), min_salience, len(results) - len(filtered),
+    )
     return filtered
 
 
@@ -410,6 +414,8 @@ def filter_by_entity(
 
     target_set = {e.lower() for e in target_entities}
 
+    _boosted = 0
+    _penalized = 0
     for r in results:
         sender = r.get("sender", "").lower()
         recipient = r.get("recipient", "").lower()
@@ -430,8 +436,16 @@ def filter_by_entity(
         # No connection at all -> small penalty
         if boost == 0.0:
             boost = -0.15
+            _penalized += 1
+        else:
+            _boosted += 1
 
         r["entity_boost"] = boost
+
+    _log.debug(
+        "salience.filter_by_entity entities=%r boosted=%d penalized=%d total=%d",
+        list(target_set), _boosted, _penalized, len(results),
+    )
 
     # Sort by combined score: original search score (if present) + entity boost
     def sort_key(r: dict) -> float:
@@ -500,6 +514,10 @@ def apply_salience_guard(
 
     # Step 1: Detect entities in the query
     entities = detect_entities(query, conn=conn)
+    _log.debug(
+        "salience.apply_salience_guard entities_detected=%r",
+        entities,
+    )
 
     # Step 2: Filter low-salience noise
     results = filter_by_salience(results, min_salience=min_salience)
