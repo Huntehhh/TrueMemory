@@ -115,6 +115,7 @@ def test_mcp_handlers_are_async():
         "truememory_forget",
         "truememory_stats",
         "truememory_entity_profile",
+        "truememory_status",
     ]
     for name in expected_async:
         fn = getattr(ms, name)
