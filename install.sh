@@ -113,19 +113,38 @@ main() {
   say "adding uv's tool dir to your shell rc (reversible)..."
   uv tool update-shell >/dev/null 2>&1 || true
 
+  # Resolve the tool venv's python up front so steps 4 and 5 can invoke
+  # `python -m truememory.mcp_server` / `python -m truememory.ingest.cli`
+  # directly instead of the `truememory-mcp` / `truememory-ingest` console-
+  # script shims.
+  #
+  # Why: on Windows, those `.exe` shims are setuptools/uv trampolines with
+  # a unique per-install hash, which Microsoft Defender's ASR rule
+  # 01443614 ("Block executable files from running unless they meet a
+  # prevalence, age, or trusted list criteria") blocks on hardened-dev-box
+  # configurations. We keep the install.sh path consistent with install.ps1
+  # so a single canonical invocation works across all platforms — even
+  # though POSIX doesn't have ASR, the shim is the only difference and
+  # it's a brittle dependency on $PATH resolution timing.
+  TOOL_PYTHON="$(uv tool dir)/truememory/bin/python"
+  if [ ! -x "$TOOL_PYTHON" ]; then
+    die "could not locate the truememory tool venv python at $TOOL_PYTHON"
+  fi
+
   # ---------- step 4: auto-configure Claude ----------
   if [ "${TRUEMEMORY_SKIP_SETUP:-}" = "1" ]; then
     say "skipping Claude setup (TRUEMEMORY_SKIP_SETUP=1)"
   else
     say "configuring Claude Code / Claude Desktop..."
-    # truememory-mcp lives at ~/.local/bin/truememory-mcp. Its sys.executable
-    # resolves to the isolated tool venv, so Claude gets a stable absolute path.
-    truememory-mcp --setup || \
-      warn "auto-setup returned non-zero (you can re-run it with: truememory-mcp --setup)"
+    # Invoke via `python -m truememory.mcp_server` — see comment above for
+    # the Windows ASR rationale. The module's `if __name__ == '__main__'`
+    # block routes `--setup` through the same code path as the shim.
+    "$TOOL_PYTHON" -m truememory.mcp_server --setup || \
+      warn "auto-setup returned non-zero (you can re-run it with: python -m truememory.mcp_server --setup)"
 
     say "installing hooks and CLAUDE.md instructions..."
-    truememory-ingest install || \
-      warn "hook install returned non-zero (you can re-run it with: truememory-ingest install)"
+    "$TOOL_PYTHON" -m truememory.ingest.cli install || \
+      warn "hook install returned non-zero (you can re-run it with: python -m truememory.ingest.cli install)"
   fi
 
   # ---------- step 5: pre-download models for all tiers ----------
@@ -135,7 +154,6 @@ main() {
   # Use the tool's Python to run the download inside the uv venv.
   # stderr is NOT suppressed — HuggingFace's tqdm progress bars show
   # download percentage, speed, and ETA, which is better UX than silence.
-  TOOL_PYTHON="$(uv tool dir)/truememory/bin/python"
   if [ -x "$TOOL_PYTHON" ]; then
     # Edge: Model2Vec embedder (usually bundled) + MiniLM reranker
     say "  [1/3] Edge reranker (MiniLM-L-6-v2, ~22MB)..."
