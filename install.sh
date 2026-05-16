@@ -44,7 +44,11 @@ die()  { warn "error: $*"; exit 1; }
 
 # ---------- main ----------
 main() {
-  set -eu
+  # pipefail catches mid-pipeline failures that `set -e` alone misses
+  # (e.g. a network drop inside `curl ... | sh` where curl returns 0
+  # but sh aborts partway). Bash-only but the script already uses
+  # `$(...)` and `||` constructs that assume a modern shell.
+  set -euo pipefail
 
   TRUEMEMORY_PY="${TRUEMEMORY_PY:-3.12}"
   TRUEMEMORY_EXTRAS="${TRUEMEMORY_EXTRAS:-}"
@@ -126,14 +130,21 @@ main() {
   # so a single canonical invocation works across all platforms — even
   # though POSIX doesn't have ASR, the shim is the only difference and
   # it's a brittle dependency on $PATH resolution timing.
+  #
+  # Missing TOOL_PYTHON is a `warn`, not a `die`: the user may have set
+  # TRUEMEMORY_SKIP_SETUP=1 and skipped the Claude-config step entirely,
+  # in which case dying here would block the model-download step they
+  # likely still want.
   TOOL_PYTHON="$(uv tool dir)/truememory/bin/python"
-  if [ ! -x "$TOOL_PYTHON" ]; then
-    die "could not locate the truememory tool venv python at $TOOL_PYTHON"
-  fi
 
   # ---------- step 4: auto-configure Claude ----------
   if [ "${TRUEMEMORY_SKIP_SETUP:-}" = "1" ]; then
     say "skipping Claude setup (TRUEMEMORY_SKIP_SETUP=1)"
+  elif [ ! -x "$TOOL_PYTHON" ]; then
+    warn "could not locate tool venv python at $TOOL_PYTHON — skipping Claude setup."
+    warn "Re-run manually after opening a new terminal:"
+    warn "  python -m truememory.mcp_server --setup"
+    warn "  python -m truememory.ingest.cli install"
   else
     say "configuring Claude Code / Claude Desktop..."
     # Invoke via `python -m truememory.mcp_server` — see comment above for
