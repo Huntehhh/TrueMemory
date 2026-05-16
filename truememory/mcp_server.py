@@ -1118,7 +1118,14 @@ def _reap_children() -> None:
     Without this, Popen'd ingest processes become <defunct> zombies after
     they finish, and os.kill(pid, 0) / ps still sees them as alive —
     permanently blocking spawn gate slots.
+
+    POSIX-only: Windows has no equivalent zombie-process concept (terminated
+    children release their PID immediately), so os.WNOHANG is not exposed
+    on win32. Without this guard, the backlog drainer crashes on every
+    boot for every Windows user.
     """
+    if not hasattr(os, "WNOHANG"):
+        return
     try:
         while True:
             pid, _ = os.waitpid(-1, os.WNOHANG)
