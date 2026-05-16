@@ -1,5 +1,58 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+- **MCP cold-start resilience** — three compounding failure modes that left
+  the MCP server permanently hung or crashed on boot:
+  1. **Sync handlers** — all 9 `@mcp.tool()` handlers were sync `def`, so one
+     blocked handler froze every concurrent JSON-RPC request on FastMCP's
+     single event-loop thread. Converted to `async def` with engine calls
+     wrapped in `asyncio.to_thread`. The `@tracked` telemetry decorator is
+     now async-aware (detects coroutine functions and wraps accordingly).
+  2. **Reranker preload hangs** — `CrossEncoder(...)` in `_preload_models`
+     blocked indefinitely on a corrupt HuggingFace cache, a stalled
+     download, or a Windows Defender ASR denial of the sentencepiece shim.
+     Added a 30s watchdog (`TRUEMEMORY_RERANKER_TIMEOUT_SEC` override); on
+     timeout, the reranker is marked degraded and rerank entrypoints fall
+     back to original-ordering results. `_set_reranker` also short-circuits
+     when degraded so search calls don't block on the stalled load's lock.
+     The degraded state surfaces in the F06 health payload — operators see
+     it in `truememory_stats` instead of digging through logs.
+  3. **`os.WNOHANG` is POSIX-only** — `_reap_children` called
+     `os.waitpid(-1, os.WNOHANG)`, crashing every Windows user's backlog
+     drainer with `AttributeError` on every boot. Guarded with `hasattr`.
+
+- **Engine concurrent-store throughput** — `add()` now pre-computes content
+  and separation embeddings BEFORE acquiring `_write_lock`. Previously the
+  lock was held during both `model.encode()` calls (~10–50 ms each),
+  serializing concurrent stores. PyTorch releases the GIL inside `.encode()`,
+  so concurrent stores now overlap on inference; they only contend at the
+  INSERTs (μs).
+
+- **`pytest` collection on Windows** — four `@pytest.mark.skipif` decorators
+  in `tests/ingest/test_robustness_fixes.py` referenced `os.geteuid()` at
+  module import time. `geteuid` is POSIX-only; pytest collection crashed on
+  Windows with `AttributeError`. Guarded with `not hasattr(os, "geteuid")
+  or os.geteuid() == 0` — skips on Windows AND on POSIX root (both cases
+  where `chmod` permission tests can't enforce read-only).
+
+### Added
+- `TRUEMEMORY_RERANKER_TIMEOUT_SEC` env var (default 30 s, minimum 1 s)
+  bounds the reranker preload watchdog. Values ≤ 0 fall back to the default
+  with a warning (the legitimate "skip preload" path is
+  `TRUEMEMORY_LAZY_MODELS=1`, not `TIMEOUT_SEC=0`).
+- `reranker.is_degraded()` / `reranker.mark_degraded(reason)` — public API
+  for runtime degraded-state coordination between the MCP server's watchdog
+  and the rerank entrypoints.
+- `tests/test_cold_start_resilience.py` — 14 regression locks: WNOHANG
+  guard, degraded-flag lifecycle, watchdog timeout + fast-load
+  non-regression, `_set_reranker` short-circuit, health-payload wiring,
+  timeout-parser validation.
+- `tests/test_concurrent_store_hang.py` — 3 regression locks for the
+  parallel-store hang: engine.add() concurrency, MCP handler async shape,
+  asyncio.gather end-to-end.
+
 ## [0.6.8] — 2026-05-11
 
 ### Fixed
