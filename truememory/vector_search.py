@@ -897,12 +897,15 @@ def migrate_legacy_vec_tables(conn: sqlite3.Connection) -> bool:
 
     Detects whether the old generic ``vec_messages`` / ``vec_messages_sep``
     tables exist and copies their data into the tier-specific tables for
-    the current tier group.  Populates the ``vector_cache_registry`` so
-    future operations use the new names.
+    the correct tier group (determined from stored metadata, defaulting to
+    edge since pre-tier-switch versions used Model2Vec).  Populates the
+    ``vector_cache_registry`` so future operations use the new names.
+
+    Always registers the edge group for legacy tables so switch-back works.
 
     Returns True if migration occurred, False if nothing to migrate.
     """
-    import time as _time
+    from truememory.tier_switch.cache import VectorCacheRegistry
 
     has_old = conn.execute(
         "SELECT name FROM sqlite_master WHERE name='vec_messages' AND type='table'"
@@ -910,9 +913,10 @@ def migrate_legacy_vec_tables(conn: sqlite3.Connection) -> bool:
     if not has_old:
         return False
 
-    group = _active_tier_group()
+    stored_model, _ = _read_embedder_metadata(conn)
+    group = _MODEL_TO_GROUP.get(stored_model, "edge")
     if group not in _VALID_GROUPS:
-        return False
+        group = "edge"
 
     new_vec = f"vec_messages_{group}"
     new_sep = f"vec_messages_sep_{group}"
@@ -958,16 +962,16 @@ def migrate_legacy_vec_tables(conn: sqlite3.Connection) -> bool:
     ).fetchone()[0] or 0
 
     model_map = {"edge": "potion-base-8M", "basepro": "Qwen3-Embedding-0.6B"}
-    now = _time.time()
-    conn.execute(
-        "INSERT OR REPLACE INTO vector_cache_registry "
-        "(tier_group, vec_table, sep_table, last_embedded_id, "
-        "vector_count, model_name, embedding_dim, last_updated, created) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (group, new_vec, new_sep, max_id, count,
-         model_map.get(group, ""), dim, now, now),
+    VectorCacheRegistry.set(
+        conn,
+        group,
+        vec_table=new_vec,
+        sep_table=new_sep,
+        last_embedded_id=max_id,
+        vector_count=count,
+        model_name=model_map.get(group, "potion-base-8M"),
+        embedding_dim=dim,
     )
-    conn.commit()
 
     logger.info(
         "Migrated %d vectors from vec_messages → %s (group=%s)",
