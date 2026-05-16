@@ -107,20 +107,45 @@ if ($uvToolDir) {
     }
 }
 
+# Resolve the tool venv's python.exe up front. We invoke `python.exe -m
+# <module>` for every subsequent step instead of the bare `truememory-mcp`
+# / `truememory-ingest` console-script shims.
+#
+# Why: those `.exe` shims are setuptools/uv trampolines with a unique
+# per-install hash. Windows Defender's ASR rule
+# 01443614-cd74-433a-b99e-2ecdc07bfc25 ("Block executable files from
+# running unless they meet a prevalence, age, or trusted list criteria")
+# silently blocks them at launch on hardened-dev-box configurations
+# because the cloud-prevalence check fails. Routing through `python.exe`
+# (signed by the PSF / Astral Python distribution) bypasses the check —
+# python.exe is high-prevalence and trusted.
+#
+# See: https://learn.microsoft.com/en-us/defender-endpoint/attack-surface-reduction-rules-reference
+$toolPython = $null
+if ($uvToolDir) {
+    $candidate = Join-Path $uvToolDir "truememory\Scripts\python.exe"
+    if (Test-Path $candidate) {
+        $toolPython = $candidate
+    }
+}
+if (-not $toolPython) {
+    Die "could not locate the truememory tool venv python at $uvToolDir\truememory\Scripts\python.exe"
+}
+
 # ---------- step 4: auto-configure Claude ----------
 if ($env:TRUEMEMORY_SKIP_SETUP -eq "1") {
     Say "skipping Claude setup (TRUEMEMORY_SKIP_SETUP=1)"
 } else {
     Say "configuring Claude Code / Claude Desktop..."
-    & truememory-mcp --setup
+    & $toolPython -m truememory.mcp_server --setup
     if ($LASTEXITCODE -ne 0) {
-        Warn "auto-setup returned non-zero (you can re-run it with: truememory-mcp --setup)"
+        Warn "auto-setup returned non-zero (you can re-run it with: python -m truememory.mcp_server --setup)"
     }
 
     Say "installing hooks and CLAUDE.md instructions..."
-    & truememory-ingest install
+    & $toolPython -m truememory.ingest.cli install
     if ($LASTEXITCODE -ne 0) {
-        Warn "hook install returned non-zero (you can re-run it with: truememory-ingest install)"
+        Warn "hook install returned non-zero (you can re-run it with: python -m truememory.ingest.cli install)"
     }
 }
 
@@ -128,7 +153,6 @@ if ($env:TRUEMEMORY_SKIP_SETUP -eq "1") {
 Say "pre-downloading models for all tiers (Edge + Base + Pro)..."
 Say "  this takes 2-5 min but means tier switching just works afterward."
 
-$toolPython = Join-Path (& uv tool dir 2>$null) "truememory\Scripts\python.exe"
 if (Test-Path $toolPython) {
     Say "  [1/3] Edge reranker (MiniLM-L-6-v2, ~22MB)..."
     & $toolPython -c "from sentence_transformers import CrossEncoder; CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')"
@@ -187,4 +211,11 @@ Write-Host "    uv tool uninstall truememory   " -NoNewline; Write-Host "# unins
 Write-Host ""
 Write-Host "  Note:" -ForegroundColor Yellow -NoNewline
 Write-Host " If commands are not found, close and reopen PowerShell."
+Write-Host ""
+Write-Host "  If Windows Defender blocks ``truememory-mcp.exe`` / ``truememory-ingest.exe``" -ForegroundColor Yellow
+Write-Host "  with 'Block executable files from running unless they meet a prevalence," -ForegroundColor Yellow
+Write-Host "  age, or trusted list criteria' (ASR rule 01443614), run the equivalent" -ForegroundColor Yellow
+Write-Host "  module form instead — the python.exe wrapper is signed and passes ASR:" -ForegroundColor Yellow
+Write-Host "    python -m truememory.mcp_server --setup"
+Write-Host "    python -m truememory.ingest.cli install"
 Write-Host ""

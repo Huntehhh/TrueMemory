@@ -1,5 +1,32 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+- **Installer trampolines blocked by Windows Defender ASR** —
+  ``install.ps1`` and ``install.sh`` invoked the
+  ``truememory-mcp --setup`` and ``truememory-ingest install`` console-
+  script shims directly. Those shims are setuptools / uv trampolines with
+  a per-install unique SHA-256, which Microsoft Defender's Attack-Surface-
+  Reduction rule
+  ``01443614-cd74-433a-b99e-2ecdc07bfc25`` ("Block executable files from
+  running unless they meet a prevalence, age, or trusted list criteria")
+  silently kills at ``CreateProcess`` time on hardened-dev-box
+  configurations: the binary has zero machines worth of MS cloud
+  prevalence so the launch is blocked before any user code runs. (The
+  rule defaults to Audit-only per DISA STIG and CIS Benchmark, but a
+  growing share of Windows-11 hardened-baseline images run it in Block
+  mode.) Switched both installers to invoke ``$toolPython -m
+  truememory.mcp_server --setup`` / ``$toolPython -m
+  truememory.ingest.cli install`` — the routing through the PSF-signed
+  high-prevalence ``python.exe`` is invisible to ASR. Same mechanic the
+  ``mcp_server._setup_claude`` writer already uses when it registers the
+  MCP server with Claude Code / Claude Desktop, so the installer is now
+  consistent with the runtime config it produces. Added a Windows-ASR
+  troubleshooting section to the installer's "done" banner and to the
+  README so users on the rare *Block*-mode hosts can re-run the
+  equivalent module form manually if upgrading.
+
 ## [0.6.8] — 2026-05-11
 
 ### Fixed
