@@ -1028,10 +1028,11 @@ def _touch_search_time() -> None:
 def _preload_models():
     """Pre-load ML models in background threads so the first search is fast.
 
-    Set TRUEMEMORY_LAZY_MODELS=1 to skip preloading (models load on first search).
+    Disabled by default (lazy load on first search). Set
+    TRUEMEMORY_PRELOAD_MODELS=1 to enable eager preloading.
     """
-    if os.environ.get("TRUEMEMORY_LAZY_MODELS", "") == "1":
-        log.info("Model preloading disabled (TRUEMEMORY_LAZY_MODELS=1)")
+    if os.environ.get("TRUEMEMORY_PRELOAD_MODELS", "") != "1":
+        log.info("Models will load on first search (set TRUEMEMORY_PRELOAD_MODELS=1 to preload)")
         return
 
     def _load_embedding_model_and_db():
@@ -1481,10 +1482,11 @@ def main():
     except Exception:
         pass
 
-    # Kick off model preloading before entering the event loop. Models
-    # load in background threads (~2.5s) while the MCP handshake
-    # completes (~1-3s), so the first search arrives with warm models.
-    _preload_models()
+    # Start shared model server (loads models once for all processes).
+    # Falls back to per-process loading if server can't start.
+    from truememory.model_client import ensure_server_running
+    if not ensure_server_running():
+        _preload_models()
 
     # Start background backlog drainer — processes queued session
     # transcripts every 60s while the MCP server is alive, respecting
