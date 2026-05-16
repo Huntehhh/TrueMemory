@@ -22,15 +22,16 @@ _PROFILES = {
     "performance": {"max_gb": float("inf"), "gpu_max": 16, "cpu_max": 100},
 }
 
-_GOOD = {"ram": 65.0, "load": 3.5, "temp": 68.0}
-_BAD = {"ram": 82.0, "load": 9.0, "temp": 78.0}
-_CRITICAL = {"ram": 94.0, "load": 18.0, "temp": 86.0}
-_GOOD_NO_TEMP = {"ram": 60.0, "load": 3.5}
-_BAD_NO_TEMP = {"ram": 75.0, "load": 9.0}
-_CRITICAL_NO_TEMP = {"ram": 90.0, "load": 18.0}
+# RAM thresholds in AVAILABLE GB (not percentage — percentage fails on high-baseline machines)
+_GOOD = {"ram_avail_gb": 4.0, "load": 3.5, "temp": 68.0}
+_BAD = {"ram_avail_gb": 2.0, "load": 9.0, "temp": 78.0}
+_CRITICAL = {"ram_avail_gb": 1.0, "load": 18.0, "temp": 86.0}
+_GOOD_NO_TEMP = {"ram_avail_gb": 4.0, "load": 3.5}
+_BAD_NO_TEMP = {"ram_avail_gb": 2.0, "load": 9.0}
+_CRITICAL_NO_TEMP = {"ram_avail_gb": 1.0, "load": 18.0}
 
-_SAMPLE_INTERVAL = 10
-_SAMPLES_PER_WINDOW = 3
+_SAMPLE_INTERVAL = 5
+_SAMPLES_PER_WINDOW = 2
 _GOOD_WINDOWS_REQUIRED = 3
 _RAMP_COOLDOWN = 120
 _THROTTLE_LOCKOUT = 300
@@ -99,8 +100,10 @@ class DynamicThrottler:
             return False
 
     def _sample_metrics(self) -> dict:
+        vm = psutil.virtual_memory()
         metrics = {
-            "ram": psutil.virtual_memory().percent,
+            "ram_avail_gb": vm.available / (1024**3),
+            "ram_pct": vm.percent,
             "load": psutil.getloadavg()[0],
             "temp": 0.0,
             "timestamp": time.time(),
@@ -119,8 +122,9 @@ class DynamicThrottler:
         return metrics
 
     def _is_good(self, metrics: dict) -> bool:
+        """All metrics in safe range. RAM: more available = better (above threshold)."""
         good = _GOOD if self.has_temp else _GOOD_NO_TEMP
-        if metrics["ram"] >= good["ram"]:
+        if metrics["ram_avail_gb"] < good["ram_avail_gb"]:
             return False
         if metrics["load"] >= good["load"]:
             return False
@@ -129,8 +133,9 @@ class DynamicThrottler:
         return True
 
     def _is_bad(self, metrics: dict) -> bool:
+        """Any metric in danger zone. RAM: less available = worse (below threshold)."""
         bad = _BAD if self.has_temp else _BAD_NO_TEMP
-        if metrics["ram"] > bad["ram"]:
+        if metrics["ram_avail_gb"] < bad["ram_avail_gb"]:
             return True
         if metrics["load"] > bad["load"]:
             return True
@@ -139,8 +144,9 @@ class DynamicThrottler:
         return False
 
     def _is_critical(self, metrics: dict) -> bool:
+        """Any metric at critical level — panic."""
         crit = _CRITICAL if self.has_temp else _CRITICAL_NO_TEMP
-        if metrics["ram"] > crit["ram"]:
+        if metrics["ram_avail_gb"] < crit["ram_avail_gb"]:
             return True
         if metrics["load"] > crit["load"]:
             return True
