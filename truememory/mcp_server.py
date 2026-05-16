@@ -942,7 +942,7 @@ def truememory_configure(
 
 @mcp.tool()
 @_tracked("tool_status")
-def truememory_status(status_id: int = 0) -> str:
+async def truememory_status(status_id: int = 0) -> str:
     """Check the progress of a tier-switch re-embedding operation.
 
     Args:
@@ -950,13 +950,15 @@ def truememory_status(status_id: int = 0) -> str:
                    a re-embedding was started. Pass 0 (default) to get
                    the most recent rebuild status.
     """
-    try:
-        from truememory.tier_switch.manager import RebuildManager
-        manager = RebuildManager.get_instance()
-        status = manager.get_status(status_id)
-        return json.dumps(status, indent=2, default=str)
-    except Exception as e:
-        return json.dumps({"error": f"{type(e).__name__}: {e}"})
+    def _query():
+        try:
+            from truememory.tier_switch.manager import RebuildManager
+            manager = RebuildManager.get_instance()
+            status = manager.get_status(status_id)
+            return json.dumps(status, indent=2, default=str)
+        except Exception as e:
+            return json.dumps({"error": f"{type(e).__name__}: {e}"})
+    return await asyncio.to_thread(_query)
 
 
 @mcp.tool()
