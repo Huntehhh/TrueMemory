@@ -1291,13 +1291,26 @@ def _drain_batch_from_backlog(markers: list[Path]) -> None:
                     _log_dir / f"{_safe_sid}.log",
                     "a", encoding="utf-8",
                 )
+                # start_new_session is POSIX-only (creates a new process group
+                # via setsid(2)). On Windows, use CREATE_NEW_PROCESS_GROUP +
+                # DETACHED_PROCESS instead. hasattr(os, "setsid") is the
+                # canonical POSIX probe — it's absent on Windows.
+                _popen_kwargs: dict = {}
+                if hasattr(os, "setsid"):
+                    _popen_kwargs["start_new_session"] = True
+                else:
+                    import subprocess as _subprocess_mod
+                    _popen_kwargs["creationflags"] = (
+                        _subprocess_mod.CREATE_NEW_PROCESS_GROUP
+                        | getattr(_subprocess_mod, "DETACHED_PROCESS", 0)
+                    )
                 try:
                     proc = _subprocess.Popen(
                         cmd,
                         stdout=_log_file,
                         stderr=_subprocess.STDOUT,
                         stdin=_subprocess.DEVNULL,
-                        start_new_session=True,
+                        **_popen_kwargs,
                     )
                 finally:
                     _log_file.close()
