@@ -22,6 +22,7 @@ Configuration via environment variables:
 
 from __future__ import annotations
 
+import asyncio
 import gc
 import json
 import logging
@@ -431,7 +432,21 @@ def _set_reranker(model_name: str):
     On failure: store the error in ``_reranker_last_error`` so F07's health
     payload can surface the degradation; log at WARNING once per distinct
     error to avoid spamming logs on every search call.
+
+    If the reranker has already been marked degraded (preload watchdog timed
+    out, or a prior load raised), short-circuit immediately. Without this,
+    every search call here would block on the same ``reranker._lock`` that
+    the stalled preload thread is holding, defeating the whole point of the
+    async-handler + watchdog fix by serializing the thread pool instead of
+    the event loop.
     """
+    try:
+        from truememory.reranker import is_degraded
+        if is_degraded():
+            return
+    except ImportError:
+        pass
+
     try:
         from truememory.reranker import get_reranker
         get_reranker(model_name=model_name)
@@ -530,7 +545,7 @@ def _parallel_search(queries, user_id, internal_limit, llm_fn, output_limit):
 
 @mcp.tool()
 @_tracked("tool_store")
-def truememory_store(
+async def truememory_store(
     content: str,
     user_id: str = "",
     metadata: str = "",
@@ -556,13 +571,17 @@ def truememory_store(
         meta = json.loads(metadata) if metadata else None
     except (json.JSONDecodeError, ValueError):
         meta = None
-    result = m.add(content=content, user_id=user_id or None, metadata=meta)
+    # Run engine.add in a thread so the FastMCP event loop stays free to
+    # accept concurrent JSON-RPC requests (fixes parallel-store hang).
+    result = await asyncio.to_thread(
+        m.add, content=content, user_id=user_id or None, metadata=meta
+    )
     return json.dumps(result, indent=2)
 
 
 @mcp.tool()
 @_tracked("tool_search")
-def truememory_search(
+async def truememory_search(
     query: str,
     user_id: str = "",
     limit: int = 10,
@@ -595,18 +614,21 @@ def truememory_search(
 
     if len(queries) == 1:
         m = _get_memory()
-        results = m.search_deep(
+        results = await asyncio.to_thread(
+            m.search_deep,
             queries[0], user_id=uid, limit=_SEARCH_INTERNAL_LIMIT, llm_fn=llm_fn,
         )
         return json.dumps(results[:limit], indent=2)
 
-    results = _parallel_search(queries, uid, _SEARCH_INTERNAL_LIMIT, llm_fn, limit)
+    results = await asyncio.to_thread(
+        _parallel_search, queries, uid, _SEARCH_INTERNAL_LIMIT, llm_fn, limit
+    )
     return json.dumps(results, indent=2)
 
 
 @mcp.tool()
 @_tracked("tool_search_deep")
-def truememory_search_deep(
+async def truememory_search_deep(
     query: str,
     user_id: str = "",
     limit: int = 10,
@@ -640,25 +662,28 @@ def truememory_search_deep(
 
     if len(queries) == 1:
         m = _get_memory()
-        results = m.search_deep(
+        results = await asyncio.to_thread(
+            m.search_deep,
             queries[0], user_id=uid, limit=_DEEP_INTERNAL_LIMIT, llm_fn=llm_fn,
         )
         return json.dumps(results[:limit], indent=2)
 
-    results = _parallel_search(queries, uid, _DEEP_INTERNAL_LIMIT, llm_fn, limit)
+    results = await asyncio.to_thread(
+        _parallel_search, queries, uid, _DEEP_INTERNAL_LIMIT, llm_fn, limit
+    )
     return json.dumps(results, indent=2)
 
 
 @mcp.tool()
 @_tracked("tool_get")
-def truememory_get(memory_id: int) -> str:
+async def truememory_get(memory_id: int) -> str:
     """Get a specific memory by its ID.
 
     Args:
         memory_id: The integer ID of the memory to retrieve.
     """
     m = _get_memory()
-    result = m.get(memory_id)
+    result = await asyncio.to_thread(m.get, memory_id)
     if result is None:
         return json.dumps({"error": f"Memory {memory_id} not found"})
     return json.dumps(result, indent=2)
@@ -666,26 +691,30 @@ def truememory_get(memory_id: int) -> str:
 
 @mcp.tool()
 @_tracked("tool_forget")
-def truememory_forget(memory_id: int) -> str:
+async def truememory_forget(memory_id: int) -> str:
     """Delete a memory by its ID.
 
     Args:
         memory_id: The integer ID of the memory to delete.
     """
     m = _get_memory()
-    deleted = m.delete(memory_id)
+    deleted = await asyncio.to_thread(m.delete, memory_id)
     return json.dumps({"deleted": deleted, "memory_id": memory_id})
 
 
 @mcp.tool()
 @_tracked("tool_stats")
-def truememory_stats() -> str:
+async def truememory_stats() -> str:
     """Get memory system statistics. On first run, returns a welcome message
     and setup instructions — present these to the user to walk them through
     choosing Edge, Base, or Pro tier."""
     m = _get_memory()
-    m._engine._ensure_connection()
-    stats = m.stats()
+    # Stats touches the DB (ensure_connection + COUNT queries) — run in a
+    # thread so the event loop stays free for other MCP requests.
+    def _gather_stats():
+        m._engine._ensure_connection()
+        return m.stats()
+    stats = await asyncio.to_thread(_gather_stats)
     config = _load_config()
     stats["version"] = __version__
     stats["tier"] = config.get("tier", "edge")
@@ -927,7 +956,7 @@ def truememory_configure(
 
 @mcp.tool()
 @_tracked("tool_status")
-def truememory_status(status_id: int = 0) -> str:
+async def truememory_status(status_id: int = 0) -> str:
     """Check the progress of a tier-switch re-embedding operation.
 
     Args:
@@ -935,18 +964,20 @@ def truememory_status(status_id: int = 0) -> str:
                    a re-embedding was started. Pass 0 (default) to get
                    the most recent rebuild status.
     """
-    try:
-        from truememory.tier_switch.manager import RebuildManager
-        manager = RebuildManager.get_instance()
-        status = manager.get_status(status_id)
-        return json.dumps(status, indent=2, default=str)
-    except Exception as e:
-        return json.dumps({"error": f"{type(e).__name__}: {e}"})
+    def _query():
+        try:
+            from truememory.tier_switch.manager import RebuildManager
+            manager = RebuildManager.get_instance()
+            status = manager.get_status(status_id)
+            return json.dumps(status, indent=2, default=str)
+        except Exception as e:
+            return json.dumps({"error": f"{type(e).__name__}: {e}"})
+    return await asyncio.to_thread(_query)
 
 
 @mcp.tool()
 @_tracked("tool_entity_profile")
-def truememory_entity_profile(entity: str) -> str:
+async def truememory_entity_profile(entity: str) -> str:
     """Get the personality profile for an entity (person).
 
     Returns communication style, preferences, traits, and topics
@@ -956,16 +987,19 @@ def truememory_entity_profile(entity: str) -> str:
         entity: Name of the person/entity to look up.
     """
     m = _get_memory()
-    m._engine._ensure_connection()
 
-    try:
-        from truememory.personality import get_entity_profile
-        profile = get_entity_profile(m._engine.conn, entity)
-        if profile:
-            return json.dumps(profile, indent=2, default=str)
-        return json.dumps({"error": f"No profile found for '{entity}'"})
-    except Exception as e:
-        return json.dumps({"error": str(e)})
+    def _lookup():
+        m._engine._ensure_connection()
+        try:
+            from truememory.personality import get_entity_profile
+            profile = get_entity_profile(m._engine.conn, entity)
+            if profile:
+                return json.dumps(profile, indent=2, default=str)
+            return json.dumps({"error": f"No profile found for '{entity}'"})
+        except Exception as e:
+            return json.dumps({"error": str(e)})
+
+    return await asyncio.to_thread(_lookup)
 
 
 # ---------------------------------------------------------------------------
@@ -1025,11 +1059,58 @@ def _touch_search_time() -> None:
         _idle_timer.start()
 
 
+_RERANKER_LOAD_TIMEOUT_DEFAULT_SEC = 30
+
+
+def _parse_reranker_timeout(raw_value: str | None, default: int = 30) -> int:
+    """Parse the reranker preload timeout env value.
+
+    Clamps non-positive values to ``default`` with a warning so a typo
+    (``TRUEMEMORY_RERANKER_TIMEOUT_SEC=`` in a shell script → ``0``) can
+    never disable the safety net. The legitimate "skip preload entirely"
+    path is ``TRUEMEMORY_LAZY_MODELS=1``, not ``TIMEOUT_SEC=0``.
+
+    Non-integer values fall back to default with a warning. ``None``
+    (env var unset) returns ``default`` silently.
+    """
+    if raw_value is None:
+        return default
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError):
+        log.warning(
+            "TRUEMEMORY_RERANKER_TIMEOUT_SEC=%r is not an integer; using "
+            "default %ds.", raw_value, default,
+        )
+        return default
+    if value <= 0:
+        log.warning(
+            "TRUEMEMORY_RERANKER_TIMEOUT_SEC=%d is invalid (minimum 1s); "
+            "using default %ds. To skip preload entirely, set "
+            "TRUEMEMORY_LAZY_MODELS=1.", value, default,
+        )
+        return default
+    return value
+
+
+_RERANKER_LOAD_TIMEOUT_SEC = _parse_reranker_timeout(
+    os.environ.get("TRUEMEMORY_RERANKER_TIMEOUT_SEC"),
+    _RERANKER_LOAD_TIMEOUT_DEFAULT_SEC,
+)
+
+
 def _preload_models():
     """Pre-load ML models in background threads so the first search is fast.
 
-    Disabled by default (lazy load on first search). Set
-    TRUEMEMORY_PRELOAD_MODELS=1 to enable eager preloading.
+    Set TRUEMEMORY_LAZY_MODELS=1 to skip preloading (models load on first search).
+
+    Reranker load is bounded by TRUEMEMORY_RERANKER_TIMEOUT_SEC (default 30s).
+    If CrossEncoder construction hangs — typically a corrupt HuggingFace cache,
+    a blocked download, or a Windows Defender ASR rule denying a sentencepiece
+    shim — the watchdog marks the reranker degraded and search falls back to
+    non-reranked results instead of blocking every subsequent MCP call. The
+    degraded state is also written into the F06 health payload so
+    truememory_stats surfaces it without operators digging through logs.
     """
     if os.environ.get("TRUEMEMORY_PRELOAD_MODELS", "") != "1":
         log.info("Models will load on first search (set TRUEMEMORY_PRELOAD_MODELS=1 to preload)")
@@ -1050,13 +1131,28 @@ def _preload_models():
         try:
             from truememory.reranker import get_reranker
             get_reranker(model_name=_current_reranker())
-        except Exception:
-            pass
+        except Exception as e:
+            from truememory.reranker import mark_degraded
+            reason = f"preload raised {type(e).__name__}: {e}"
+            mark_degraded(reason)
+            _record_reranker_error(reason)
+
+    def _watch_reranker(thread: threading.Thread):
+        thread.join(timeout=_RERANKER_LOAD_TIMEOUT_SEC)
+        if thread.is_alive():
+            from truememory.reranker import mark_degraded
+            reason = (
+                f"preload exceeded {_RERANKER_LOAD_TIMEOUT_SEC}s (override "
+                "with TRUEMEMORY_RERANKER_TIMEOUT_SEC)"
+            )
+            mark_degraded(reason)
+            _record_reranker_error(reason)
 
     t1 = threading.Thread(target=_load_embedding_model_and_db, daemon=True)
     t2 = threading.Thread(target=_load_reranker, daemon=True)
     t1.start()
     t2.start()
+    threading.Thread(target=_watch_reranker, args=(t2,), daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
@@ -1099,7 +1195,14 @@ def _reap_children() -> None:
     Without this, Popen'd ingest processes become <defunct> zombies after
     they finish, and os.kill(pid, 0) / ps still sees them as alive —
     permanently blocking spawn gate slots.
+
+    POSIX-only: Windows has no equivalent zombie-process concept (terminated
+    children release their PID immediately), so os.WNOHANG is not exposed
+    on win32. Without this guard, the backlog drainer crashes on every
+    boot for every Windows user.
     """
+    if not hasattr(os, "WNOHANG"):
+        return
     try:
         while True:
             pid, _ = os.waitpid(-1, os.WNOHANG)
