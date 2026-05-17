@@ -1463,7 +1463,12 @@ def main():
         return 2
 
     # No args → this is the Claude-Code-invoked MCP server path.
-    #
+    try:
+        import setproctitle
+        setproctitle.setproctitle("TrueMemory MCP")
+    except ImportError:
+        pass
+
     # HuggingFace offline mode — skip HTTP freshness checks when models are
     # cached. Models are downloaded on first install; subsequent loads
     # should be pure disk reads (~170ms) instead of HTTP round-trips

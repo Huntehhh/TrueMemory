@@ -336,6 +336,12 @@ def main():
         format="%(asctime)s [model_server] %(levelname)s %(message)s",
     )
 
+    try:
+        import setproctitle
+        setproctitle.setproctitle("TrueMemory")
+    except ImportError:
+        pass
+
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
 
