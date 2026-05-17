@@ -38,7 +38,6 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from unittest.mock import patch
 
 import pytest
 
@@ -115,7 +114,7 @@ def test_delete_in_chunks_keeps_each_chunk_below_sqlite_default_limit():
     """Default chunk size (500) keeps every batch well under SQLite's
     historical 999-variable cap. A future bump to chunk_size above 999
     would re-introduce the original bug on older SQLite builds."""
-    from truememory.engine import _delete_in_chunks, _SQLITE_IN_CHUNK
+    from truememory.engine import _SQLITE_IN_CHUNK
     assert _SQLITE_IN_CHUNK <= 999, (
         f"_SQLITE_IN_CHUNK={_SQLITE_IN_CHUNK} exceeds the conservative "
         f"SQLITE_MAX_VARIABLE_NUMBER=999 floor; older system SQLite "
