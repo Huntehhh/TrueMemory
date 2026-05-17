@@ -1,5 +1,43 @@
 # Changelog
 
+## [0.6.9] — 2026-05-17
+
+### Fixed
+- **MPS memory balloon during tier switch** — re-embedding previously
+  allocated 17 GB of MPS memory on a 24 GB machine, causing overheating
+  and lag. Now capped via `PYTORCH_MPS_HIGH_WATERMARK_RATIO` per machine
+  (50% for <=24 GB, 55% for 32 GB+). Live test: peak 1.88 GB. (#354)
+- **Config flip before rebuild completion** — tier config was written to
+  disk before re-embedding started; if the rebuild failed or timed out,
+  the user was left on the new tier with zero vectors. Config now only
+  changes in `_finalize_rebuild()` after 100% completion. (#354)
+- **No hard timeout on re-embedding** — a stuck rebuild would run
+  forever. Added 2.5-hour hard timeout; progress is saved so delta
+  rebuild can resume. (#354)
+- **MPS low watermark crash on PyTorch 2.11** — setting a custom high
+  watermark ratio without also setting the low watermark caused
+  "invalid low watermark ratio 1.4" on first MPS allocation. (#354)
+- **STABLE state never returned to PROBING** — after a WARNING step-down,
+  the throttler stayed at batch=1 permanently because there was no
+  STABLE->PROBING transition. Now re-enters PROBING after 3 consecutive
+  OK safety checks. (#354)
+- **Hook paths break on reinstall** — Claude Code hooks used hardcoded
+  `site-packages` file paths that broke during `pip install -e .` or
+  reinstalls. Now uses `python -m` module invocation. (#354)
+
+### Added
+- **Adaptive MPS throttler** — three-channel monitoring (MPS memory
+  level, memory growth rate, thermal pressure via `pmset`) with a
+  PROBING/STABLE/BACKOFF state machine. Starts at batch=1, ramps up
+  slowly with triple-sample verification, backs off immediately on
+  pressure. (#354)
+- **Sustained workload detection in model server** — throttler only
+  activates during re-embedding (>10 embed requests in 30s), not
+  during normal single-query search. (#354)
+- **Conditional MPS cache flush** — `torch.mps.empty_cache()` only
+  called on WARNING/BACKOFF states, not every batch (reduces
+  fragmentation overhead during normal operation). (#354)
+
 ## [0.6.8] — 2026-05-11
 
 ### Fixed
