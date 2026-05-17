@@ -16,6 +16,8 @@ from truememory.tier_switch.throttler import DynamicThrottler
 
 log = logging.getLogger(__name__)
 
+_HARD_TIMEOUT = 9000  # 2.5 hours
+
 StatusCallback = Callable[[int, int, dict], None]
 
 
@@ -101,12 +103,22 @@ class RebuildWorker:
         processed = 0
         last_id = 0
         offset = 0
+        start_time = time.time()
 
         with no_grad:
             while offset < total:
                 if self._cancelled:
                     log.info("RebuildWorker cancelled at %d/%d", processed, total)
                     self._update_status("cancelled", processed, total)
+                    return False, processed
+
+                if time.time() - start_time > _HARD_TIMEOUT:
+                    log.warning(
+                        "Re-embedding timed out at %d/%d (%.0f%%) after %.0f minutes",
+                        processed, total, processed / total * 100,
+                        (time.time() - start_time) / 60,
+                    )
+                    self._update_status("timeout", processed, total)
                     return False, processed
 
                 batch_size, metrics = self.throttler.before_batch()

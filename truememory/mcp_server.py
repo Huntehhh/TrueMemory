@@ -772,10 +772,9 @@ def truememory_configure(
                 "error": "api_provider must be one of: anthropic, openrouter, openai",
             })
 
-    # Save to persistent config
+    # Save to persistent config (tier change deferred to _finalize_rebuild)
     config = _load_config()
     old_tier = config.get("tier", "edge")
-    config["tier"] = tier
 
     # Store API key if provided
     if api_key and api_provider:
@@ -797,7 +796,8 @@ def truememory_configure(
     except Exception:
         pass
 
-    _save_config(config)
+    if api_key or email:
+        _save_config(config)
 
     # Invalidate cached LLM function so it picks up the new key
     if api_key:

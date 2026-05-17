@@ -115,7 +115,7 @@ def _request_with_autostart(request: dict) -> dict:
     """Send request, auto-starting server if needed."""
     try:
         return _send_request(request)
-    except (ConnectionRefusedError, FileNotFoundError, OSError):
+    except (ConnectionRefusedError, FileNotFoundError, socket.timeout, OSError):
         pass
 
     if not _start_server():

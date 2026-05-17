@@ -8,19 +8,36 @@ Auto-exits after idle timeout (default 300s, configurable via
 TRUEMEMORY_MODEL_SERVER_IDLE env var).
 """
 
-import gc
-import logging
 import os
-import pickle
-import signal
-import socket
-import struct
-import sys
-import threading
-import time
-from pathlib import Path
+import psutil
 
-import numpy as np
+
+def _set_mps_memory_cap():
+    """Set MPS memory cap BEFORE torch is imported."""
+    if os.environ.get("PYTORCH_MPS_HIGH_WATERMARK_RATIO"):
+        return
+    total_gb = psutil.virtual_memory().total / (1024**3)
+    if total_gb >= 32:
+        ratio = "0.55"
+    else:
+        ratio = "0.50"
+    os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = ratio
+
+
+_set_mps_memory_cap()
+
+import gc  # noqa: E402
+import logging  # noqa: E402
+import pickle  # noqa: E402
+import signal  # noqa: E402
+import socket  # noqa: E402
+import struct  # noqa: E402
+import sys  # noqa: E402
+import threading  # noqa: E402
+import time  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+import numpy as np  # noqa: E402
 
 log = logging.getLogger(__name__)
 
