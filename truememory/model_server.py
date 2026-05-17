@@ -22,6 +22,7 @@ def _set_mps_memory_cap():
     else:
         ratio = "0.50"
     os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = ratio
+    os.environ.setdefault("PYTORCH_MPS_LOW_WATERMARK_RATIO", "0.0")
 
 
 _set_mps_memory_cap()
