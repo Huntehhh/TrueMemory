@@ -123,8 +123,16 @@ def hydrate_config(config: LLMConfig) -> LLMConfig:
         # Normalize to underscore form for downstream dispatch
         config.provider = "claude_cli"
         # No api_key, no base_url — the CLI handles auth and routing.
-        # Leave model empty by default so the CLI picks the user's
-        # configured default (usually Opus); callers can override.
+        # Default to Haiku 4.5 for fact extraction. Without an explicit
+        # --model, the CLI inherits the user's Claude Code default —
+        # typically Opus 4.7, which burns ~600x more subscription quota
+        # per extraction than Haiku and is overkill for structured
+        # atomic-fact extraction. Override via TRUEMEMORY_CLAUDE_MODEL
+        # for cases that genuinely need a stronger model.
+        if not config.model:
+            config.model = os.environ.get(
+                "TRUEMEMORY_CLAUDE_MODEL", "claude-haiku-4-5"
+            )
 
     return config
 
