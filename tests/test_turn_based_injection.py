@@ -122,6 +122,44 @@ def test_already_injected_unknown_session_is_false(truememory_home):
 # ---------------------------------------------------------------------------
 # is_subagent_invocation — guard semantics
 # ---------------------------------------------------------------------------
+#
+# DESIGN NOTE for upstream reviewers
+# ----------------------------------
+# Per the canonical Claude Code hooks docs (code.claude.com/docs/en/hooks),
+# sub-agents spawned via the Task tool fire SessionStart, UserPromptSubmit,
+# and SessionEnd hooks in their own session context — same as the main
+# thread. This is intentional behavior on Anthropic's side.
+#
+# This PR adds a runtime guard (`is_subagent_invocation` in `_shared.py`)
+# that causes all three TrueMemory hooks to early-return when invoked
+# inside a sub-agent. Two reasons:
+#
+#   1. Sub-agent prompts are orchestrator-generated, not real user input.
+#      Ingesting them into TrueMemory pollutes the memory store with
+#      task-context strings rather than user facts.
+#   2. On Windows, every sub-agent spawn produces 1-3 hook subprocess
+#      fires, each of which causes a console window flash (Claude Code's
+#      Node spawn omits `windowsHide: true` and there is no settings.json
+#      escape hatch). The guard collapses each fire into a <10ms no-op so
+#      the user-visible noise is minimized.
+#
+# This is a Hunter-specific design preference and may disagree with
+# upstream's intent. If you (upstream maintainer) want the canonical
+# "sub-agents fire hooks normally" behavior, the guard can be made
+# opt-in via a `TRUEMEMORY_SKIP_SUBAGENT_HOOKS` env var (default off).
+# Happy to refactor as a follow-up commit if you'd prefer that shape.
+#
+# Detection uses two signals (either sufficient):
+#   - `agent_id` field in hook stdin — the canonical sub-agent signal
+#     per docs ("Present only when the hook fires inside a subagent call").
+#   - `/subagents/` directory component in `transcript_path` — fallback
+#     for older Claude Code versions (pre-v2.1.69) and any event where
+#     `agent_id` might be absent.
+#
+# Crucially, `agent_type` is NOT used as a signal — it's also set for
+# user-launched `--agent <name>` main sessions where the user IS the
+# speaker. Using it would silently skip real user prompts. The tests
+# below lock that decision in.
 
 
 def test_subagent_guard_agent_id_present(truememory_home):
