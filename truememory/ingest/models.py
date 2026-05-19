@@ -13,6 +13,7 @@ so latency is not critical. Prefer local models for zero-cost operation.
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import os
@@ -24,8 +25,71 @@ import time
 import urllib.request
 import urllib.error
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 
 log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Claude CLI usage telemetry (instrumentation overlay — local/diagnostic only)
+# ---------------------------------------------------------------------------
+#
+# Hunter is hitting Claude subscription rate limits and the suspect chokepoints
+# are TrueMemory's HyDE calls (search_deep), background ingestion (per-chunk
+# Haiku), and the once-per-session turn-based injection. ALL of those funnel
+# through `_complete_claude_cli` below.
+#
+# Every invocation appends one JSON line to ~/.truememory/claude-cli-usage.jsonl
+# capturing: timestamp, model, caller (module:function:line — walked back from
+# the stack), prompt size, response size, duration, exit code, PID. With this
+# we can `jq` per-caller per-hour breakdowns to pinpoint who's burning quota.
+#
+# Append-only. Crash-tolerant (try/finally so failures still log). Never
+# raises — instrumentation must NOT crash the LLM call path.
+
+_CLAUDE_CLI_USAGE_LOG = Path.home() / ".truememory" / "claude-cli-usage.jsonl"
+
+
+def _identify_claude_cli_caller() -> str:
+    """Walk the call stack to find the first frame outside this models.py
+    module. Returns a `<module>.<function>:<line>` string for log correlation.
+    """
+    try:
+        this_file = os.path.basename(__file__)
+        for frame_info in inspect.stack()[1:]:
+            fname = os.path.basename(frame_info.filename)
+            if fname != this_file:
+                module = Path(frame_info.filename).stem
+                return f"{module}.{frame_info.function}:{frame_info.lineno}"
+    except Exception:
+        pass
+    return "unknown"
+
+
+def _log_claude_cli_usage(
+    *, model: str, caller: str, prompt_chars: int, response_chars: int,
+    duration_ms: int, exit_code: int, error: str = "",
+) -> None:
+    """Append-only JSONL telemetry. NEVER raises — wrapped in broad except."""
+    try:
+        _CLAUDE_CLI_USAGE_LOG.parent.mkdir(parents=True, exist_ok=True)
+        record = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "model": model,
+            "caller": caller,
+            "prompt_chars": prompt_chars,
+            "response_chars": response_chars,
+            "duration_ms": duration_ms,
+            "exit_code": exit_code,
+            "pid": os.getpid(),
+        }
+        if error:
+            record["error"] = error[:200]
+        with open(_CLAUDE_CLI_USAGE_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+    except Exception:
+        pass  # telemetry must never crash the caller
 
 
 class LLMError(Exception):
@@ -401,65 +465,92 @@ def _complete_claude_cli(config: LLMConfig, prompt: str, system: str) -> str:
 
     Raises LLMError on CLI failure or malformed output.
     """
-    if not _claude_cli_available():
-        raise LLMError(
-            "`claude` CLI not found on PATH. Install Claude Code or "
-            "choose a different --provider."
-        )
-
-    # Claude CLI supports a system prompt via --append-system-prompt; we fold
-    # any system content into the user prompt for simplicity (extractors
-    # embed their system prompt in the user message anyway).
-    full_prompt = f"{system}\n\n{prompt}" if system else prompt
-
-    _claude_exe = shutil.which("claude") or "claude"
-    cmd = [_claude_exe, "-p", "--output-format", "json"]
-    if config.model:
-        cmd.extend(["--model", config.model])
-
-    # Strip ANTHROPIC_API_KEY so the CLI uses OAuth/keychain auth rather
-    # than a potentially stale key from the parent environment.
-    env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
-
+    # Telemetry state — populated below, written by `finally` block.
+    # See _log_claude_cli_usage above for the full schema rationale.
+    _tele = {
+        "model": config.model or "default",
+        "caller": _identify_claude_cli_caller(),
+        "prompt_chars": len(prompt) + (len(system) if system else 0),
+        "response_chars": 0,
+        "exit_code": -1,
+        "error": "",
+    }
     _t_cli_start = time.time()
+
     try:
-        proc = subprocess.run(
-            cmd,
-            input=full_prompt,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=120,
-            env=env,
-            check=False,
+        if not _claude_cli_available():
+            _tele["error"] = "cli_not_on_path"
+            raise LLMError(
+                "`claude` CLI not found on PATH. Install Claude Code or "
+                "choose a different --provider."
+            )
+
+        # Claude CLI supports a system prompt via --append-system-prompt; we fold
+        # any system content into the user prompt for simplicity (extractors
+        # embed their system prompt in the user message anyway).
+        full_prompt = f"{system}\n\n{prompt}" if system else prompt
+
+        _claude_exe = shutil.which("claude") or "claude"
+        cmd = [_claude_exe, "-p", "--output-format", "json"]
+        if config.model:
+            cmd.extend(["--model", config.model])
+
+        # Strip ANTHROPIC_API_KEY so the CLI uses OAuth/keychain auth rather
+        # than a potentially stale key from the parent environment.
+        env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
+
+        try:
+            proc = subprocess.run(
+                cmd,
+                input=full_prompt,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=120,
+                env=env,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as e:
+            _tele["error"] = "timeout_120s"
+            raise LLMError("claude CLI timed out after 120s") from e
+        except OSError as e:
+            _tele["error"] = f"oserror:{e}"
+            raise LLMError(f"claude CLI invocation failed: {e}") from e
+
+        _tele["exit_code"] = proc.returncode
+        _cli_elapsed = time.time() - _t_cli_start
+        log.info(
+            "claude_cli: returncode=%d elapsed=%.1fs model=%s",
+            proc.returncode, _cli_elapsed, config.model or "default",
         )
-    except subprocess.TimeoutExpired as e:
-        raise LLMError("claude CLI timed out after 120s") from e
-    except OSError as e:
-        raise LLMError(f"claude CLI invocation failed: {e}") from e
 
-    _cli_elapsed = time.time() - _t_cli_start
-    log.info(
-        "claude_cli: returncode=%d elapsed=%.1fs model=%s",
-        proc.returncode, _cli_elapsed, config.model or "default",
-    )
+        if proc.returncode != 0:
+            stderr = (proc.stderr or "").strip()[:500]
+            _tele["error"] = stderr[:200] or "nonzero_exit"
+            raise LLMError(f"claude CLI exit {proc.returncode}: {stderr or 'no stderr'}")
 
-    if proc.returncode != 0:
-        stderr = (proc.stderr or "").strip()[:500]
-        raise LLMError(f"claude CLI exit {proc.returncode}: {stderr or 'no stderr'}")
+        # Parse the --output-format json envelope: {type, subtype, is_error, result, ...}
+        try:
+            data = json.loads(proc.stdout)
+        except json.JSONDecodeError as e:
+            _tele["error"] = "non_json_output"
+            raise LLMError(f"claude CLI returned non-JSON: {proc.stdout[:300]}") from e
 
-    # Parse the --output-format json envelope: {type, subtype, is_error, result, ...}
-    try:
-        data = json.loads(proc.stdout)
-    except json.JSONDecodeError as e:
-        raise LLMError(f"claude CLI returned non-JSON: {proc.stdout[:300]}") from e
+        if data.get("is_error"):
+            _tele["error"] = f"cli_reported_error:{str(data.get('result',''))[:120]}"
+            raise LLMError(f"claude CLI reported error: {data.get('result', 'unknown')}")
 
-    if data.get("is_error"):
-        raise LLMError(f"claude CLI reported error: {data.get('result', 'unknown')}")
+        result = data.get("result")
+        if not isinstance(result, str):
+            _tele["error"] = "missing_result_field"
+            raise LLMError(f"claude CLI response missing 'result' string: {data}")
 
-    result = data.get("result")
-    if not isinstance(result, str):
-        raise LLMError(f"claude CLI response missing 'result' string: {data}")
+        _tele["response_chars"] = len(result)
+        return result
 
-    return result
+    finally:
+        _log_claude_cli_usage(
+            duration_ms=int((time.time() - _t_cli_start) * 1000),
+            **_tele,
+        )
