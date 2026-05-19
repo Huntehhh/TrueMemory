@@ -120,6 +120,58 @@ def test_already_injected_unknown_session_is_false(truememory_home):
 
 
 # ---------------------------------------------------------------------------
+# is_subagent_invocation — guard semantics
+# ---------------------------------------------------------------------------
+
+
+def test_subagent_guard_agent_id_present(truememory_home):
+    """agent_id in stdin is the canonical sub-agent signal — must trigger guard."""
+    shared = truememory_home["shared"]
+    assert shared.is_subagent_invocation({"agent_id": "agent-xyz"}) is True
+
+
+def test_subagent_guard_subagents_path(truememory_home, tmp_path):
+    """transcript_path containing /subagents/ is the fallback signal — must trigger guard."""
+    shared = truememory_home["shared"]
+    sub_tp = str(tmp_path / "sess-abc" / "subagents" / "agent-y.jsonl")
+    assert shared.is_subagent_invocation({}, transcript_path=sub_tp) is True
+    # Windows backslash form must also match
+    win_tp = r"C:\Users\x\.claude\projects\proj\sess\subagents\agent-y.jsonl"
+    assert shared.is_subagent_invocation({}, transcript_path=win_tp) is True
+
+
+def test_subagent_guard_agent_type_alone_is_NOT_subagent(truememory_home):
+    """agent_type without agent_id and without /subagents/ in path is the
+    `--agent <name>` main-session case. The user IS the speaker; their
+    prompts are real user input and must be ingested. The guard must NOT
+    trigger here."""
+    shared = truememory_home["shared"]
+    main_session_tp = r"C:\Users\x\.claude\projects\proj\sess-abc.jsonl"
+    assert shared.is_subagent_invocation(
+        {"agent_type": "novius-clinical-advisor"},
+        transcript_path=main_session_tp,
+    ) is False
+
+
+def test_subagent_guard_main_session_is_not_subagent(truememory_home):
+    """Plain main-thread fire with no agent_id, no agent_type, no /subagents/ path."""
+    shared = truememory_home["shared"]
+    assert shared.is_subagent_invocation({"session_id": "abc"}) is False
+    assert shared.is_subagent_invocation(
+        {"session_id": "abc", "transcript_path": "C:/proj/sess.jsonl"}
+    ) is False
+
+
+def test_subagent_guard_empty_input(truememory_home):
+    """No input at all → safe default: not a sub-agent (don't false-positive
+    on init failures that produce empty stdin)."""
+    shared = truememory_home["shared"]
+    assert shared.is_subagent_invocation() is False
+    assert shared.is_subagent_invocation(None) is False
+    assert shared.is_subagent_invocation({}) is False
+
+
+# ---------------------------------------------------------------------------
 # _build_turn_based_query tests
 # ---------------------------------------------------------------------------
 
