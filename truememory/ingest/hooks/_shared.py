@@ -38,22 +38,34 @@ def _safe_session_id(session_id: str) -> str:
 def is_subagent_invocation(input_data: dict | None = None, transcript_path: str = "") -> bool:
     """Detect whether this hook fire is from a Claude Code sub-agent (Task tool).
 
-    Hooks fire per-session, and sub-agents are separate sessions from the
-    orchestrator. Without a guard, every sub-agent spawn produces 1-3 hook
-    fires, which floods the user with terminal flashes and pollutes the
-    memory store with orchestrator-generated prompts (not real user input).
+    Sub-agents are separate sessions from the orchestrator. Without a guard,
+    every sub-agent spawn produces 1-3 hook fires, which pollutes the memory
+    store with orchestrator-generated prompts (not real user input).
 
-    Two detection paths, either is sufficient:
-    1. ``input_data["agent_id"]`` or ``input_data["agent_type"]`` is present
-       (newer Claude Code versions include these fields in hook stdin JSON).
-    2. The transcript path contains ``/subagents/`` — Claude Code stores
-       sub-agent transcripts under
-       ``<project>/<session_id>/subagents/agent-<id>.jsonl``. Robust fallback
-       for older Claude Code versions that don't emit the agent_id field.
+    Two detection signals, either is sufficient:
+
+    1. ``input_data["agent_id"]`` is present. Per the canonical Claude Code
+       hooks docs: "agent_id — Unique identifier for the subagent. Present
+       only when the hook fires inside a subagent call." This is the
+       authoritative signal — Claude Code emits it specifically to let
+       hooks distinguish sub-agent fires from main-thread fires.
+
+    2. The transcript path contains ``subagents`` as a directory component.
+       Claude Code stores sub-agent transcripts at
+       ``~/.claude/projects/<project>/<session_id>/subagents/agent-<id>.jsonl``.
+       Robust fallback for older Claude Code versions (pre-v2.1.69 didn't
+       emit ``agent_id``) and for any event where the field might be absent
+       (e.g., ``SessionStart`` in some SDK paths).
+
+    Importantly: ``agent_type`` is NOT a sub-agent signal. It is also set
+    for ``--agent <name>`` main sessions where the user is running a
+    custom-agent persona AS the main thread — those prompts ARE real user
+    input and must be ingested. Using ``agent_type`` would false-positive
+    on that case.
     """
+    if isinstance(input_data, dict) and input_data.get("agent_id"):
+        return True
     if isinstance(input_data, dict):
-        if input_data.get("agent_id") or input_data.get("agent_type"):
-            return True
         tp = transcript_path or input_data.get("transcript_path", "")
     else:
         tp = transcript_path
