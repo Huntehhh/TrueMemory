@@ -198,38 +198,61 @@ def auto_detect() -> LLMConfig:
     Detect the best available LLM backend.
 
     Priority:
-    1. Ollama (free, local, no API key, fully offline)
-    2. Claude CLI (free for subscribers, uses OAuth — no API key)
-    3. OpenRouter (one key for many models)
-    4. Anthropic (direct API)
+    1. Explicit override via ``TRUEMEMORY_INGEST_PROVIDER`` env var (wins all)
+    2. Ollama (free, local, no API key, fully offline)
+    3. Claude CLI (free for subscribers, uses OAuth — no API key)
+       — skipped when ``TRUEMEMORY_DISABLE_CLAUDE_CLI=1`` is set so
+       background extraction can route to a paid API instead of burning
+       subscription quota. Mirrors the same env var already honored by
+       ``mcp_server._build_llm_fn``.
+    4. OpenRouter (one key for many models)
+    5. Anthropic (direct API)
     """
-    # 1. Ollama — fully offline, no cost, first choice
+    # 1. Explicit override — exists to let users route background extraction
+    # to a paid API (Anthropic/OpenRouter) while keeping the Claude CLI on
+    # PATH for other tooling. Without this, Claude CLI at priority 3 always
+    # wins for users running Claude Code, causing every background ingest
+    # call to burn subscription quota (high-volume problem when SessionEnd
+    # fires often and transcripts have many chunks).
+    forced = os.environ.get("TRUEMEMORY_INGEST_PROVIDER", "").strip().lower()
+    if forced and forced not in ("auto", ""):
+        log.info("Forced provider via TRUEMEMORY_INGEST_PROVIDER: %s", forced)
+        return hydrate_config(LLMConfig(provider=forced))
+
+    cli_disabled = os.environ.get(
+        "TRUEMEMORY_DISABLE_CLAUDE_CLI", ""
+    ).lower() in ("1", "true", "yes")
+
+    # 2. Ollama — fully offline, no cost, first choice
     if _ollama_available():
         cfg = hydrate_config(LLMConfig(provider="ollama"))
         log.info("Auto-detected Ollama with model %s", cfg.model)
         return cfg
 
-    # 2. Claude CLI — zero additional cost for subscribers, no key mgmt
-    if _claude_cli_available():
+    # 3. Claude CLI — zero additional cost for subscribers, no key mgmt.
+    # Skipped when explicitly disabled so the user can opt out of having
+    # background ingestion eat their Claude Code subscription quota.
+    if _claude_cli_available() and not cli_disabled:
         log.info("Auto-detected Claude CLI (subscription auth)")
         return hydrate_config(LLMConfig(provider="claude_cli"))
 
-    # 3. OpenRouter
+    # 4. OpenRouter
     if os.environ.get("OPENROUTER_API_KEY", ""):
         log.info("Auto-detected OpenRouter API key")
         return hydrate_config(LLMConfig(provider="openrouter"))
 
-    # 4. Anthropic
+    # 5. Anthropic
     if os.environ.get("ANTHROPIC_API_KEY", ""):
         log.info("Auto-detected Anthropic API key")
         return hydrate_config(LLMConfig(provider="anthropic"))
 
     raise RuntimeError(
         "No LLM backend found for fact extraction. Options:\n"
-        "  1. Run Ollama locally: ollama serve && ollama pull qwen2.5:7b-instruct\n"
-        "  2. Install Claude Code (provides `claude` CLI + subscription auth)\n"
-        "  3. Set OPENROUTER_API_KEY environment variable\n"
-        "  4. Set ANTHROPIC_API_KEY environment variable"
+        "  1. Set TRUEMEMORY_INGEST_PROVIDER=<provider> + the matching API key env var\n"
+        "  2. Run Ollama locally: ollama serve && ollama pull qwen2.5:7b-instruct\n"
+        "  3. Install Claude Code (provides `claude` CLI + subscription auth)\n"
+        "  4. Set OPENROUTER_API_KEY environment variable\n"
+        "  5. Set ANTHROPIC_API_KEY environment variable"
     )
 
 
