@@ -98,4 +98,13 @@ These are local-fork-only and explicitly NOT for upstream PR:
 
 ---
 
+---
+
+## Hunter's open actions (not for Josh — personal tracker)
+
+- [ ] **Send the Letta consolidation email to Josh.** Draft at [`letta-email-to-josh.md`](./letta-email-to-josh.md). Need to fill in Josh's email address, attach the 5 markdown files listed at the bottom of the draft (`~/.claude/_BEST-practices-GLOBAL/memory-systems/letta-consolidation-shippable-plan.md` + 4 `letta-impl-A/B/C/D-*.md` siblings), copy body into Gmail, send.
+- [ ] **Set `TRUEMEMORY_BACKLOG_BATCH_SIZE=1`** in env (system or `~/.truememory/config.json`) to smooth cascade-drain bursts. See §3 above.
+
+---
+
 _Maintained by Hunter Casillas (`@Huntehhh`). Drop a comment in this file or open an issue on the fork if any of these are worth a real conversation._
