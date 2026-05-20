@@ -105,6 +105,21 @@ These are local-fork-only and explicitly NOT for upstream PR:
 - [ ] **Send the Letta consolidation email to Josh.** Draft at [`letta-email-to-josh.md`](./letta-email-to-josh.md). Need to fill in Josh's email address, attach the 5 markdown files listed at the bottom of the draft (`~/.claude/_BEST-practices-GLOBAL/memory-systems/letta-consolidation-shippable-plan.md` + 4 `letta-impl-A/B/C/D-*.md` siblings), copy body into Gmail, send.
 - [ ] **Set `TRUEMEMORY_BACKLOG_BATCH_SIZE=1`** in env (system or `~/.truememory/config.json`) to smooth cascade-drain bursts. See §3 above.
 
+### Env vars cheatsheet (TrueMemory tuning levers)
+
+| Var | Default | What it controls |
+|---|---|---|
+| `TRUEMEMORY_MAX_EXTRACTIONS_PER_HOUR` | `20` | Hard ceiling on background ingestion subprocesses spawned per hour. Sessions over the cap are SKIPPED (not deferred). Hunter's current preference: leave at 20. |
+| `TRUEMEMORY_BACKLOG_BATCH_SIZE` | `3` | How many previously-failed sessions to retry per SessionStart. Lower = smoother burst rate. Hunter's recommended setting: `1` for burst smoothing. |
+| `TRUEMEMORY_USER_ID` | (unset) | User identifier threaded through to hooks for memory ownership. |
+| `TRUEMEMORY_DB_PATH` | `~/.truememory/memories.db` | Memory store path. |
+| `TRUEMEMORY_RECALL_LIMIT` | `25` | Default `Memory.search()` top-K. |
+| `TRUEMEMORY_CLAUDE_MODEL` | `claude-haiku-4-5` (on Hunter's fork) | Model passed to `claude -p` for extraction. |
+| `TRUEMEMORY_INJECT_AFTER_TURNS` | `13` | Turn count that triggers turn-based memory injection (PR #357). |
+| `TRUEMEMORY_INJECT_AFTER_CHARS` | `333` | Prompt length that triggers turn-based memory injection (PR #357). |
+| `CLAUDE_RATE_LIMIT_5M` | `50` | Per-5-min ceiling used by the rate-limit-proximity viz in claude-usage-analyzer.bat. |
+| `CLAUDE_RATE_LIMIT_HR` | `300` | Per-hour ceiling used by the same viz. |
+
 ---
 
 _Maintained by Hunter Casillas (`@Huntehhh`). Drop a comment in this file or open an issue on the fork if any of these are worth a real conversation._
