@@ -32,7 +32,16 @@ log = logging.getLogger(__name__)
 MEMORY_LIMIT = int(os.environ.get("TRUEMEMORY_RECALL_LIMIT", "25"))
 ONBOARDED_MARKER = Path.home() / ".truememory" / ".onboarded"
 BACKLOG_DIR = Path.home() / ".truememory" / "backlog"
-_DRAIN_CAP = 3
+
+# Backlog retry batch size — how many previously-failed sessions to retry per
+# SessionStart fire. Default 3. Lower to 1 to fully serialize the catch-up
+# (mitigates "cascade flush" API spikes when many SessionStarts arrive in
+# rapid succession — each one would otherwise drain 3 sessions, multiplying
+# the per-minute extraction-subprocess fan-out). The historic name was
+# ``_DRAIN_CAP``; the new env-var name is more descriptive of what it
+# actually controls.
+_BACKLOG_BATCH_SIZE = max(0, int(os.environ.get("TRUEMEMORY_BACKLOG_BATCH_SIZE", "3")))
+_DRAIN_CAP = _BACKLOG_BATCH_SIZE  # backward-compat alias
 
 BANNER = r"""
 ████████╗██████╗ ██╗   ██╗███████╗    ███╗   ███╗███████╗███╗   ███╗ ██████╗ ██████╗ ██╗   ██╗
@@ -137,14 +146,24 @@ def _check_email_needed() -> str:
 def _drain_backlog() -> None:
     """Process queued sessions from the backlog directory.
 
-    Uses the flock-based spawn gate from core to prevent the avalanche
-    scenario where N concurrent SessionStart hooks all drain simultaneously,
-    spawning N × _DRAIN_CAP ingest processes.
+    Retries up to ``_BACKLOG_BATCH_SIZE`` previously-failed sessions per
+    SessionStart fire. Uses the flock-based spawn gate from core to prevent
+    the avalanche scenario where N concurrent SessionStart hooks all drain
+    simultaneously, spawning N × _BACKLOG_BATCH_SIZE ingest processes.
+
+    Tunable via ``TRUEMEMORY_BACKLOG_BATCH_SIZE`` env var (default 3). Set
+    to 1 to fully serialize the catch-up — useful when many SessionStarts
+    arrive in rapid succession (each draining 3 sessions otherwise causes
+    cascade fan-out that spikes the Claude/Anthropic per-minute rate
+    window). Set to 0 to disable drain entirely (sessions accumulate in
+    the backlog until manually processed).
     """
+    if _BACKLOG_BATCH_SIZE == 0:
+        return
     if not BACKLOG_DIR.exists():
         return
     try:
-        markers = sorted(BACKLOG_DIR.glob("*.json"))[:_DRAIN_CAP]
+        markers = sorted(BACKLOG_DIR.glob("*.json"))[:_BACKLOG_BATCH_SIZE]
     except Exception:
         return
 
