@@ -87,8 +87,8 @@ _INTENT_RE = re.compile(
 )
 
 _TRIVIAL_WORDS = frozenset({
-    '', 'yeah', 'yep', 'yes', 'sure', 'ok', 'okay',
-    'here', "here's", 'its', "it's", 'use', 'try',
+    'yeah', 'yep', 'yes', 'sure', 'ok', 'okay',
+    'here', "here's", 'its', "it's",
     'please', 'thanks', 'thx', 'hi', 'hey',
 })
 
@@ -169,10 +169,7 @@ def _try_capture_email(prompt: str) -> None:
         stripped = prompt.strip()
         email = None
 
-        m = re.fullmatch(
-            r'[\w.+-]+@[\w-]+(?:\.[A-Za-z]{2,10}(?![A-Za-z])){1,3}',
-            stripped, re.ASCII,
-        )
+        m = _EMAIL_RE.fullmatch(stripped)
         if m:
             email = m.group(0)
 

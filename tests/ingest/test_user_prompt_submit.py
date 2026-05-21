@@ -1,14 +1,14 @@
 """Tests for _try_capture_email and _detect_recall in user_prompt_submit hook.
 
 Covers:
-  - #275: email capture hardened against injection / bogus emails
+  - #275: email capture hardened with 3-layer intent matching
   - #288: recall regex expanded to high-confidence patterns
 """
 from __future__ import annotations
 
-import importlib
 import json
 import re
+import shutil
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
@@ -18,12 +18,7 @@ import pytest
 from truememory.ingest.hooks import user_prompt_submit as ups
 
 
-@pytest.fixture(autouse=True)
-def _reload():
-    importlib.reload(ups)
-
-
-# ── helpers ──────────────────────────────────────────────────────────
+# -- helpers ---------------------------------------------------------------
 
 
 def _capture_email(prompt: str) -> str | None:
@@ -38,18 +33,55 @@ def _capture_email(prompt: str) -> str | None:
             ups._try_capture_email(prompt)
             return json.loads(cfg.read_text()).get("email")
     finally:
-        import shutil
         shutil.rmtree(tmp)
 
 
-# ── #275: email capture ─────────────────────────────────────────────
+# -- #275: email capture (3-layer intent matching) -------------------------
 
 
-class TestEmailCapture:
-    """Email capture should accept real emails and reject injection/noise."""
+class TestEmailCaptureLayer1:
+    """Layer 1: bare email via fullmatch on stripped prompt."""
 
     def test_bare_email(self):
         assert _capture_email("josh@sauron.network") == "josh@sauron.network"
+
+    def test_bare_email_with_whitespace(self):
+        assert _capture_email("  josh@example.com  ") == "josh@example.com"
+
+    def test_bare_cctld(self):
+        assert _capture_email("josh@mail.co.uk") == "josh@mail.co.uk"
+
+    def test_bare_com_au(self):
+        assert _capture_email("user@example.com.au") == "user@example.com.au"
+
+
+class TestEmailCaptureLayer2:
+    """Layer 2: email + trivial wrapper words in short prompts."""
+
+    def test_yeah_email(self):
+        assert _capture_email("yeah josh@sauron.network") == "josh@sauron.network"
+
+    def test_email_please(self):
+        assert _capture_email("josh@example.com please") == "josh@example.com"
+
+    def test_multiple_trivial_words(self):
+        assert _capture_email("hi ok josh@example.com please") == "josh@example.com"
+
+    def test_punctuation_stripped(self):
+        assert _capture_email("hey, josh@example.com!") == "josh@example.com"
+
+    def test_rejects_non_trivial_word(self):
+        assert _capture_email("deploy josh@example.com") is None
+
+    def test_rejects_use_imperative(self):
+        assert _capture_email("use admin@company.com") is None
+
+    def test_rejects_try_imperative(self):
+        assert _capture_email("try user@evil.com") is None
+
+
+class TestEmailCaptureLayer3:
+    """Layer 3: intent phrase matching with injection guard."""
 
     def test_my_email_is(self):
         assert _capture_email("my email is josh@sauron.network") == "josh@sauron.network"
@@ -57,17 +89,30 @@ class TestEmailCapture:
     def test_email_colon(self):
         assert _capture_email("email: josh@example.com") == "josh@example.com"
 
+    def test_my_email_address_is(self):
+        assert _capture_email("My email address is josh@example.com") == "josh@example.com"
+
     def test_reach_me_at(self):
         assert _capture_email("reach me at josh@company.com") == "josh@company.com"
 
-    def test_casual_wrapper(self):
-        assert _capture_email("yeah josh@sauron.network") == "josh@sauron.network"
+    def test_contact_me_at(self):
+        assert _capture_email("contact me at josh@test.org") == "josh@test.org"
 
-    def test_cctld(self):
-        assert _capture_email("josh@mail.co.uk") == "josh@mail.co.uk"
+    def test_im_at(self):
+        assert _capture_email("I'm at josh@sauron.network") == "josh@sauron.network"
 
-    def test_cctld_com_au(self):
-        assert _capture_email("my email is josh@example.com.au") == "josh@example.com.au"
+    def test_i_am_at(self):
+        assert _capture_email("i am at josh@example.com") == "josh@example.com"
+
+    def test_injection_guard_blocks_intent_plus_sql(self):
+        assert _capture_email("my email is admin@evil.com; DROP TABLE") is None
+
+    def test_injection_guard_blocks_backtick(self):
+        assert _capture_email("my email is admin@evil.com `rm -rf`") is None
+
+
+class TestEmailCaptureRejections:
+    """Prompts that should NOT capture any email."""
 
     def test_rejects_sql_injection(self):
         assert _capture_email("'; DROP TABLE users; -- admin@evil.com") is None
@@ -84,7 +129,7 @@ class TestEmailCapture:
     def test_rejects_url_email(self):
         assert _capture_email("check https://site.com?u=test@evil.com") is None
 
-    def test_rejects_someone_elses_email(self):
+    def test_rejects_third_party_email(self):
         assert _capture_email("email alice@company.com about the meeting") is None
 
     def test_rejects_config_snippet(self):
@@ -107,27 +152,31 @@ class TestEmailCapture:
                 ups._try_capture_email("new@example.com")
                 assert json.loads(cfg.read_text())["email"] == "existing@x.com"
         finally:
-            import shutil
             shutil.rmtree(tmp)
 
 
 class TestEmailRegex:
-    """_EMAIL_RE should match valid emails and reject bad TLDs."""
+    """_EMAIL_RE pattern and flags."""
 
     def test_ascii_flag(self):
         assert ups._EMAIL_RE.flags & re.ASCII
 
-    def test_valid_emails(self):
-        for email in ["josh@sauron.network", "user@example.com", "a+b@c.co"]:
-            assert ups._EMAIL_RE.search(email), f"Should match: {email}"
+    def test_unicode_excluded_from_match(self):
+        m = ups._EMAIL_RE.search("usér@example.com")
+        assert m is None or "é" not in m.group(0)
+
+    @pytest.mark.parametrize("email", [
+        "josh@sauron.network", "user@example.com", "a+b@c.co",
+    ])
+    def test_valid_emails(self, email):
+        assert ups._EMAIL_RE.search(email), f"Should match: {email}"
 
     def test_cctld_full_match(self):
         m = ups._EMAIL_RE.search("user@mail.co.uk")
         assert m and m.group(0) == "user@mail.co.uk"
 
     def test_rejects_numeric_tld(self):
-        m = ups._EMAIL_RE.search("user@host.123")
-        assert m is None
+        assert ups._EMAIL_RE.search("user@host.123") is None
 
     def test_rejects_1char_tld(self):
         assert ups._EMAIL_RE.search("user@host.x") is None
@@ -137,10 +186,10 @@ class TestEmailRegex:
 
     def test_tld_segment_cap(self):
         m = ups._EMAIL_RE.search("user@a.com.au.uk.nz.xx")
-        assert m and m.group(0).count(".") <= 4
+        assert m and m.group(0) == "user@a.com.au.uk"
 
 
-# ── #288: recall detection ──────────────────────────────────────────
+# -- #288: recall detection -----------------------------------------------
 
 
 class TestRecallDetection:
@@ -183,6 +232,7 @@ class TestRecallDetection:
         "run the test suite",
         "tell me about photosynthesis",
         "tell me about the Python GIL",
+        "I said deploy to staging",
     ])
     def test_recall_rejects_non_recall(self, prompt):
         assert not ups._detect_recall(prompt), f"Should not match: {prompt}"
