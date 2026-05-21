@@ -80,7 +80,10 @@ def get_device_id() -> str:
     except Exception:
         pass
 
-    _device_id_cache = hashlib.sha256(raw.encode()).hexdigest()[:16] if raw else "unknown"
+    if raw:
+        _device_id_cache = hashlib.sha256(raw.encode()).hexdigest()[:16]
+    else:
+        return "unknown"
     return _device_id_cache
 
 
