@@ -66,20 +66,53 @@ def _parse_args() -> argparse.Namespace:
     return args
 
 
-_EMAIL_RE = re.compile(r'[\w.+-]+@[\w-]+\.[\w.-]+')
+_EMAIL_RE = re.compile(r'[\w.+-]+@[\w-]+(?:\.[A-Za-z]{2,10}(?![A-Za-z])){1,3}', re.ASCII)
+
+_INJECTION_RE = re.compile(
+    r'\b(?:DROP|SELECT|INSERT|DELETE|UPDATE|UNION|ALTER|EXEC)\b'
+    r'|[`{};]'
+    r'|--\s',
+    re.IGNORECASE,
+)
+
+_INTENT_RE = re.compile(
+    r'(?:^|\b)(?:'
+    r'my\s+email\s+(?:is|address\s+is)\s+'
+    r'|email\s*:\s*'
+    r'|reach\s+me\s+at\s+'
+    r'|contact\s+me\s+at\s+'
+    r"|i(?:'m|\s+am)\s+at\s+"
+    r')',
+    re.IGNORECASE,
+)
+
+_TRIVIAL_WORDS = frozenset({
+    'yeah', 'yep', 'yes', 'sure', 'ok', 'okay',
+    'here', "here's", 'its', "it's",
+    'please', 'thanks', 'thx', 'hi', 'hey',
+})
 
 _RECALL_RE = re.compile(
-    r'\b(?:what(?:\'s|\s+is|\s+was|\s+are|\s+were|\s+did|\s+do)\b'
+    r'\b(?:'
+    r'what(?:\'s|\s+is|\s+was|\s+are|\s+were|\s+did|\s+do)\b'
     r'|who\s+(?:is|was|did)\b'
     r'|when\s+(?:is|was|did)\b'
     r'|where\s+(?:is|was|did|does)\b'
     r'|do\s+you\s+remember\b'
-    r'|did\s+(?:we|i|you)\b'
+    r'|can\s+you\s+recall\b'
+    r'|remind\s+me\b'
     r'|what\'s\s+my\b'
     r'|what\s+do\s+I\b'
-    r'|remind\s+me\b'
+    r'|did\s+(?:we|i|you)\b'
     r'|have\s+(?:we|i)\s+(?:ever|already)\b'
-    r'|my\s+(?:favorite|preferred|usual)\b)',
+    r'|you\s+(?:told|said|mentioned)\b'
+    r'|(?:we|i)\s+(?:discussed|decided|agreed)\b'
+    r'|last\s+(?:time|session|conversation)\s+we\b'
+    r'|(?:earlier|previously)\s+(?:you|we|i)\b'
+    r'|yesterday\s+(?:you|we|i)\b'
+    r'|previous\s+(?:session|conversation|chat)\b'
+    r'|my\s+(?:favorite|preferred|usual)\b'
+    r')',
     re.IGNORECASE,
 )
 
@@ -124,7 +157,7 @@ def _try_auto_recall(prompt: str, user_id: str, db_path: str) -> str | None:
 
 
 def _try_capture_email(prompt: str) -> None:
-    """If the user typed an email and config has no email, save it."""
+    """If the user typed their email and config has no email, save it."""
     try:
         config_path = Path.home() / ".truememory" / "config.json"
         if not config_path.exists():
@@ -132,10 +165,35 @@ def _try_capture_email(prompt: str) -> None:
         config = json.loads(config_path.read_text(encoding="utf-8"))
         if config.get("email"):
             return
-        match = _EMAIL_RE.search(prompt)
-        if not match:
+
+        stripped = prompt.strip()
+        email = None
+
+        m = _EMAIL_RE.fullmatch(stripped)
+        if m:
+            email = m.group(0)
+
+        if email is None and len(stripped) < 80:
+            em = _EMAIL_RE.search(stripped)
+            if em:
+                remainder = stripped[:em.start()] + stripped[em.end():]
+                words = re.sub(r'[,.\s!?:]+', ' ', remainder).strip().lower().split()
+                if all(w in _TRIVIAL_WORDS for w in words):
+                    email = em.group(0)
+
+        if email is None:
+            if len(prompt) > 200:
+                return
+            if _INTENT_RE.search(prompt):
+                if _INJECTION_RE.search(prompt):
+                    return
+                em = _EMAIL_RE.search(prompt)
+                if em:
+                    email = em.group(0)
+
+        if email is None:
             return
-        email = match.group(0)
+
         config["email"] = email
         tmp = config_path.with_suffix(".tmp")
         tmp.write_text(json.dumps(config, indent=2), encoding="utf-8")
