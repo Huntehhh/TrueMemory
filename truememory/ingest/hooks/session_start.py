@@ -220,8 +220,10 @@ def main():
     try:
         if _is_first_run():
             context = _first_run_context()
+            _action = "first_run_banner"
         else:
             context = recall_memories(input_data, user_id=args.user, db_path=args.db)
+            _action = "injected"
 
         # Check for available updates
         update_notice = _check_for_update()
@@ -236,6 +238,18 @@ def main():
         if context:
             output = {"additionalContext": context}
             print(json.dumps(output))
+            try:
+                from truememory.ingest.hooks._injection_log import write_injection
+                write_injection(
+                    hook="session_start",
+                    session_id=input_data.get("session_id", ""),
+                    content=context,
+                    query="blanket recall: preferences, facts, decisions, corrections, relationships",
+                    memory_count=context.count("\n- "),
+                    action=_action,
+                )
+            except Exception:
+                pass
     except Exception as e:
         log.error("SessionStart hook failed: %s", e)
 
