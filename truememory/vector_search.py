@@ -826,7 +826,7 @@ def embed_single(conn: sqlite3.Connection, message_id: int, content: str) -> Non
                 (message_id, serialize_f32(sep_embedding)),
             )
     except Exception:
-        logger.debug("Failed to create separation vector for message %d", message_id, exc_info=True)
+        logger.warning("Failed to create separation vector for message %d", message_id, exc_info=True)
     # Caller is responsible for committing
 
 

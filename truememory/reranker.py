@@ -169,11 +169,13 @@ def get_reranker(model_name: str | None = None, device: str | None = None):
     global _model, _model_name
 
     name = model_name or get_current_reranker_name()
-    if _model is not None and name == _model_name:
-        return _model  # Fast path, no lock needed
+    cached_model, cached_name = _model, _model_name
+    if cached_model is not None and name == cached_name:
+        return cached_model
     with _lock:
-        if _model is not None and name == _model_name:
-            return _model  # Another thread loaded it
+        cached_model, cached_name = _model, _model_name
+        if cached_model is not None and name == cached_name:
+            return cached_model
 
         from truememory.model_client import use_model_server, get_reranker_proxy
         if use_model_server():
