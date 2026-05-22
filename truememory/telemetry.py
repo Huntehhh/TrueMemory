@@ -58,7 +58,7 @@ def get_device_id() -> str:
     try:
         if sys.platform == "darwin":
             out = subprocess.run(
-                ["ioreg", "-rd1", "-c", "IOPlatformExpertDevice"],
+                ["/usr/sbin/ioreg", "-rd1", "-c", "IOPlatformExpertDevice"],
                 capture_output=True, text=True, timeout=5,
             )
             for line in out.stdout.splitlines():
