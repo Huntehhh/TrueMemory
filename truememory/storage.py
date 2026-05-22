@@ -14,8 +14,12 @@ Schema overview:
 """
 
 import json
+import logging
 import sqlite3
+import time
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -219,9 +223,58 @@ DEFAULT_BUSY_TIMEOUT_MS = 10_000
 # Database creation
 # ---------------------------------------------------------------------------
 
+_EXPECTED_COLUMNS = {
+    "recipient": "TEXT DEFAULT ''",
+    "category": "TEXT DEFAULT ''",
+    "modality": "TEXT DEFAULT ''",
+    "episode_id": "INTEGER DEFAULT NULL",
+    "emotional_valence": "REAL DEFAULT 0.0",
+    "embedding_separation": "BLOB DEFAULT NULL",
+}
+
+
+def _migrate_messages_schema(conn: sqlite3.Connection, db_path: str | Path) -> None:
+    """Add missing columns to an existing messages table (legacy DB upgrade).
+
+    Creates a backup of the database file before making any changes.
+    Only runs if the messages table already exists and is missing expected columns.
+    """
+    try:
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(messages)").fetchall()}
+    except Exception:
+        return
+    if not existing:
+        return
+
+    missing = {col: typedef for col, typedef in _EXPECTED_COLUMNS.items() if col not in existing}
+    if not missing:
+        return
+
+    if str(db_path) != ":memory:":
+        import shutil
+        backup = Path(str(db_path) + f".backup-pre-migration-{int(time.time())}")
+        try:
+            shutil.copy2(str(db_path), str(backup))
+            log.info("Legacy DB backup created: %s", backup)
+        except Exception as e:
+            log.warning("Could not back up database before migration: %s", e)
+            return
+
+    for col, typedef in missing.items():
+        try:
+            conn.execute(f"ALTER TABLE messages ADD COLUMN {col} {typedef}")
+            log.info("Migrated legacy DB: added column messages.%s", col)
+        except Exception as e:
+            log.warning("Failed to add column messages.%s: %s", col, e)
+
+
 def create_db(db_path: str | Path) -> sqlite3.Connection:
     """
     Create (or open) a TrueMemory database with the full schema.
+
+    If the database has an older schema (pre-v0.5), missing columns are
+    added automatically via ALTER TABLE. A timestamped backup is created
+    before any migration.
 
     Enables WAL mode for concurrent read/write performance and executes all
     CREATE TABLE / CREATE VIRTUAL TABLE / CREATE TRIGGER statements.
@@ -240,6 +293,7 @@ def create_db(db_path: str | Path) -> sqlite3.Connection:
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA cache_size=-64000")
     conn.execute("PRAGMA mmap_size=268435456")
+    _migrate_messages_schema(conn, db_path)
     conn.executescript(_SCHEMA_SQL)
     conn.commit()
     return conn
