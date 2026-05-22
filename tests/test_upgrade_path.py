@@ -18,12 +18,6 @@ import sqlite3
 
 import pytest
 
-# CI Python builds may lack sqlite3.Connection.enable_load_extension when
-# compiled without SQLITE_ENABLE_LOAD_EXTENSION.
-_conn = sqlite3.connect(":memory:")
-_HAS_LOAD_EXTENSION = hasattr(_conn, "enable_load_extension")
-_conn.close()
-
 from truememory import vector_search
 from truememory.storage import create_db
 from truememory.vector_search import (
@@ -36,6 +30,10 @@ from truememory.vector_search import (
     build_vectors,
     init_vec_table,
 )
+
+_conn = sqlite3.connect(":memory:")
+_HAS_LOAD_EXTENSION = hasattr(_conn, "enable_load_extension")
+_conn.close()
 
 
 def _fresh_conn(tmp_path) -> sqlite3.Connection:

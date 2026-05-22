@@ -238,7 +238,6 @@ def _backup_database(db_path: Path) -> Path | None:
 
     Returns the backup path on success, None on failure.
     """
-    import os
     import shutil
     import uuid
 
