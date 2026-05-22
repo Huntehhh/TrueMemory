@@ -214,6 +214,18 @@ def main():
     recall_context = _try_auto_recall(prompt, args.user, args.db)
     if recall_context:
         print(json.dumps({"additionalContext": recall_context}))
+        try:
+            from truememory.ingest.hooks._injection_log import write_injection
+            write_injection(
+                hook="user_prompt_submit",
+                session_id=session_id,
+                content=recall_context,
+                query=prompt,
+                memory_count=recall_context.count("\n- "),
+                action="injected",
+            )
+        except Exception:
+            pass
 
 
 def buffer_message(session_id: str, prompt: str):

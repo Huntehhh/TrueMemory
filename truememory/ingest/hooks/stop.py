@@ -161,6 +161,18 @@ def main():
     # Run ingestion in the background so we don't block Claude Code
     _run_background_ingestion(transcript_path, session_id, args.user, args.db)
 
+    try:
+        from truememory.ingest.hooks._injection_log import write_injection
+        write_injection(
+            hook="stop",
+            session_id=session_id,
+            content="",
+            action="queued_ingestion",
+            extra={"transcript_path": transcript_path},
+        )
+    except Exception:
+        pass
+
 
 def _writable_dirs_ok() -> bool:
     """Verify the trace and log directories exist and are writable.
