@@ -13,8 +13,13 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
+
+_HAS_BENCHMARKS = (REPO_ROOT / "benchmarks" / "gate_eval").is_dir()
+pytestmark = pytest.mark.skipif(not _HAS_BENCHMARKS, reason="benchmarks/ not present in CI")
 
 
 def test_candidate_discovery_finds_v05_baseline():
