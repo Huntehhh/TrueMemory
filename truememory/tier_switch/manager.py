@@ -85,6 +85,7 @@ class RebuildManager:
         self._active_worker: RebuildWorker | None = None
         self._active_thread: threading.Thread | None = None
         self._active_status_id: int = 0
+        self._state_lock = threading.Lock()
 
     def start_rebuild(
         self,
@@ -97,8 +98,10 @@ class RebuildManager:
 
         Returns a status_id for progress queries.
         """
-        if self._active_thread and self._active_thread.is_alive():
-            return self._active_status_id
+        with self._state_lock:
+            if self._active_thread and self._active_thread.is_alive():
+                return self._active_status_id
+            self._active_thread = threading.current_thread()
 
         conn = _open_db(db_path)
         to_group = tier_group(target_tier)
@@ -133,7 +136,8 @@ class RebuildManager:
             daemon=True,
             name=f"tier-switch-{to_group}",
         )
-        self._active_thread = thread
+        with self._state_lock:
+            self._active_thread = thread
         thread.start()
 
         return status_id
@@ -232,8 +236,10 @@ class RebuildManager:
 
     def cancel(self, status_id: int = 0):
         """Signal the active worker to stop."""
-        if self._active_worker:
-            self._active_worker.cancel()
+        with self._state_lock:
+            worker = self._active_worker
+        if worker is not None:
+            worker.cancel()
 
     def _rebuild_thread(
         self,
@@ -260,7 +266,8 @@ class RebuildManager:
                 throttler=throttler,
                 status_id=status_id,
             )
-            self._active_worker = worker
+            with self._state_lock:
+                self._active_worker = worker
 
             success, processed = worker.run(messages, is_full)
 
@@ -273,8 +280,9 @@ class RebuildManager:
         except Exception:
             log.exception("Background rebuild thread error")
         finally:
-            self._active_worker = None
-            self._active_thread = None
+            with self._state_lock:
+                self._active_worker = None
+                self._active_thread = None
             conn.close()
 
     def _finalize_rebuild(
