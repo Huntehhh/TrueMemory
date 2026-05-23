@@ -103,7 +103,19 @@ def _resolve_model_name(name: str) -> str:
     return _TIER_ALIASES.get(lowered, name)
 
 
-_raw_env = os.environ.get("TRUEMEMORY_EMBED_MODEL", "edge")
+def _default_tier() -> str:
+    """Read tier from config.json when env var is unset."""
+    try:
+        import json
+        from pathlib import Path
+        _cfg = Path.home() / ".truememory" / "config.json"
+        if _cfg.exists():
+            return json.loads(_cfg.read_text(encoding="utf-8")).get("tier", "edge")
+    except Exception:
+        pass
+    return "edge"
+
+_raw_env = os.environ.get("TRUEMEMORY_EMBED_MODEL") or _default_tier()
 EMBEDDING_MODEL = _resolve_model_name(_raw_env)
 
 _model = None
