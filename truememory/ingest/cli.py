@@ -16,7 +16,7 @@ import sys
 from pathlib import Path
 
 from truememory.ingest import ingest, save_trace, IngestionResult
-from truememory.ingest.models import LLMConfig, hydrate_config
+from truememory.ingest.models import LLMConfig, LLMAuthError, hydrate_config
 
 
 def main():
@@ -214,6 +214,21 @@ def _run_ingest(args):
             llm_config=config,
             session_id=args.session,
         )
+    except LLMAuthError as e:
+        # The LLM backend's credential is dead/expired. Don't drop this
+        # session's facts: re-queue it to the backlog (a later SessionStart
+        # drain can run the user-configured re-auth command and re-ingest).
+        # Exit 2 = auth failure (recoverable); callers can distinguish it from
+        # "no backend" (3) and "filesystem preflight" (4).
+        _queue_auth_failure(args)
+        print(
+            f"ERROR: LLM authentication failed during extraction: {e}\n"
+            "       Session re-queued to the backlog for retry after re-auth.\n"
+            "       Configure 'on_auth_failure_cmd' in ~/.truememory/config.json "
+            "(or set TRUEMEMORY_ON_AUTH_FAILURE_CMD) to auto-recover.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
     except RuntimeError as e:
         # auto_detect raises RuntimeError when no LLM backend is available
         print(f"ERROR: {e}", file=sys.stderr)
@@ -281,6 +296,20 @@ def _cascade_next() -> None:
                 claimed_path.unlink(missing_ok=True)
                 continue
 
+            # Don't re-run auth-failure markers that have exhausted their retry
+            # budget (would loop forever). Leave the marker for manual recovery
+            # — the SessionStart drain owns running the re-auth command.
+            from truememory.ingest.auth_recovery import MAX_AUTH_RETRIES
+            _retry_count = data.get("retry_count", 0)
+            if not isinstance(_retry_count, int):
+                _retry_count = 0
+            if data.get("reason") == "cli_auth_failure" and _retry_count >= MAX_AUTH_RETRIES:
+                try:
+                    claimed_path.rename(marker_path)
+                except OSError:
+                    pass
+                continue
+
             if not check_extraction_budget():
                 try:
                     claimed_path.rename(marker_path)
@@ -307,11 +336,18 @@ def _cascade_next() -> None:
                     cmd.extend(["--user", data["user_id"]])
                 if data.get("db_path"):
                     cmd.extend(["--db", data["db_path"]])
+                # Propagate the auth retry count so a repeated auth failure
+                # increments (not resets) it, keeping the recovery loop bounded.
+                _env = None
+                if data.get("reason") == "cli_auth_failure":
+                    _env = os.environ.copy()
+                    _env["TRUEMEMORY_AUTH_RETRY_COUNT"] = str(_retry_count)
                 proc = _sp.Popen(
                     cmd,
                     stdout=_sp.DEVNULL,
                     stderr=_sp.DEVNULL,
                     start_new_session=hasattr(os, 'setsid'),
+                    env=_env,
                 )
                 register_spawned_pid(proc.pid)
                 record_stale_processing_pid(claimed_path, proc.pid)
@@ -326,6 +362,65 @@ def _cascade_next() -> None:
                 claimed_path.rename(marker_path)
             except OSError:
                 pass
+
+
+def _queue_auth_failure(args) -> None:
+    """Write a backlog marker for a session that failed with an auth error.
+
+    Reuses the Stop hook's backlog directory and marker schema
+    (``transcript_path``, ``session_id``, ``user_id``, ``db_path``,
+    ``queued_at``, ``reason``) so the SessionStart drain reads it the same
+    way, and ADDS two fields the auth-recovery flow relies on:
+
+    - ``reason``      — always ``"cli_auth_failure"`` here.
+    - ``retry_count`` — number of auth-recovery attempts so far. A FRESH auth
+      failure (this ingest was not launched from a re-queued auth marker)
+      writes ``0``. When the drain re-runs an auth marker it sets
+      ``TRUEMEMORY_AUTH_RETRY_COUNT`` to the marker's current count; on a
+      repeated failure we store that + 1 so the guard in
+      ``auth_recovery.MAX_AUTH_RETRIES`` can stop an infinite re-auth ↔
+      re-ingest loop.
+
+    Best-effort: never raises. If the marker can't be written the session's
+    facts are lost, but the CLI still exits cleanly with the auth code.
+    """
+    from datetime import datetime, timezone
+    # Import the Stop hook's canonical backlog dir + sanitizer so the marker
+    # lands exactly where the drain looks and is named identically.
+    from truememory.ingest.hooks.stop import BACKLOG_DIR, _sanitize_session_id
+
+    # Fresh failure (env unset) → retry_count 0. Re-run from a backlog marker
+    # (env set by the drain) → prior + 1.
+    _raw = os.environ.get("TRUEMEMORY_AUTH_RETRY_COUNT")
+    if _raw is None:
+        retry_count = 0
+    else:
+        try:
+            retry_count = int(_raw) + 1
+        except (ValueError, TypeError):
+            retry_count = 1
+
+    try:
+        BACKLOG_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            BACKLOG_DIR.chmod(0o700)
+        except OSError:
+            pass
+        session_id = args.session or ""
+        marker = BACKLOG_DIR / f"{_sanitize_session_id(session_id)}.json"
+        marker.write_text(json.dumps({
+            "transcript_path": args.transcript,
+            "session_id": session_id,
+            "user_id": args.user or "",
+            "db_path": args.db or "",
+            "queued_at": datetime.now(timezone.utc).isoformat(),
+            "reason": "cli_auth_failure",
+            "retry_count": retry_count,
+        }), encoding="utf-8")
+    except Exception as e:  # noqa: BLE001 — best-effort, must not mask the exit
+        logging.getLogger(__name__).error(
+            "ingest: failed to queue auth-failure backlog marker: %s", e
+        )
 
 
 def _preflight_writable_target(target: str | None, *, kind: str) -> bool:

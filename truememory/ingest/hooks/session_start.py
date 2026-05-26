@@ -149,6 +149,57 @@ def _check_email_needed() -> str:
     return ""
 
 
+def _maybe_run_auth_recovery() -> None:
+    """Spawn the configured re-auth command once if any backlog marker needs it.
+
+    Scans the backlog for ``reason == "cli_auth_failure"`` markers that are
+    still under the retry cap. If at least one exists, spawns the user's
+    re-auth command exactly ONCE (detached + bounded, so it never blocks
+    session startup). The re-queued sessions are then re-ingested by the
+    normal drain on this or the next SessionStart once the credential works.
+
+    No-op (and silent) when no command is configured — recovery is opt-in.
+    Never raises.
+    """
+    try:
+        from truememory.ingest.auth_recovery import (
+            MAX_AUTH_RETRIES,
+            get_on_auth_failure_cmd,
+            spawn_auth_recovery,
+        )
+    except Exception:
+        return
+
+    # Cheap short-circuit: if no re-auth command is configured, do nothing
+    # (don't even scan the backlog).
+    if not get_on_auth_failure_cmd():
+        return
+
+    try:
+        markers = sorted(BACKLOG_DIR.glob("*.json"))
+    except Exception:
+        return
+
+    needs_recovery = False
+    for marker_path in markers:
+        try:
+            data = json.loads(marker_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if data.get("reason") != "cli_auth_failure":
+            continue
+        retry_count = data.get("retry_count", 0)
+        if not isinstance(retry_count, int):
+            retry_count = 0
+        if retry_count < MAX_AUTH_RETRIES:
+            needs_recovery = True
+            break
+
+    if needs_recovery:
+        log.info("Drain: auth-failed session(s) queued; spawning re-auth command")
+        spawn_auth_recovery()
+
+
 def _drain_backlog() -> None:
     """Process queued sessions from the backlog directory.
 
@@ -164,6 +215,12 @@ def _drain_backlog() -> None:
 
     from truememory.ingest.hooks._shared import cleanup_stale_processing, check_extraction_budget, record_stale_processing_pid
     cleanup_stale_processing(BACKLOG_DIR)
+
+    # If any queued session failed because of a dead/expired credential,
+    # kick off the user-configured re-auth command ONCE per drain (detached
+    # so it never blocks session startup). The re-queued sessions then
+    # succeed on the next drain once the credential is repaired.
+    _maybe_run_auth_recovery()
 
     try:
         markers = sorted(BACKLOG_DIR.glob("*.json"))[:_DRAIN_CAP]
@@ -184,6 +241,28 @@ def _drain_backlog() -> None:
             transcript = data.get("transcript_path", "")
             if not transcript or not Path(transcript).exists():
                 claimed_path.unlink(missing_ok=True)
+                continue
+
+            # Auth-failure markers that have already exhausted their retry
+            # budget are left in place (renamed back to .json) without
+            # re-ingesting — re-running them would just fail the same way and
+            # loop forever. We never delete the marker, so no user data is
+            # lost; an operator can fix auth manually and the next drain picks
+            # it up after we reset/raise the cap.
+            from truememory.ingest.auth_recovery import MAX_AUTH_RETRIES
+            _retry_count = data.get("retry_count", 0)
+            if not isinstance(_retry_count, int):
+                _retry_count = 0
+            if data.get("reason") == "cli_auth_failure" and _retry_count >= MAX_AUTH_RETRIES:
+                log.warning(
+                    "Drain: session %s exhausted auth retries (%d/%d); leaving "
+                    "marker for manual recovery",
+                    data.get("session_id", "?"), _retry_count, MAX_AUTH_RETRIES,
+                )
+                try:
+                    claimed_path.rename(marker_path)
+                except OSError:
+                    pass
                 continue
 
             if not check_extraction_budget():
@@ -223,12 +302,20 @@ def _drain_backlog() -> None:
                     _log_dir / f"{_safe_sid}.log",
                     "a", encoding="utf-8",
                 )
+                # For auth-failure re-runs, propagate the current retry count
+                # so that if extraction fails on auth again, the CLI writes a
+                # marker with retry_count+1 — bounding the recovery loop.
+                _env = None
+                if data.get("reason") == "cli_auth_failure":
+                    _env = os.environ.copy()
+                    _env["TRUEMEMORY_AUTH_RETRY_COUNT"] = str(_retry_count)
                 proc = subprocess.Popen(
                     cmd,
                     stdout=_log_file,
                     stderr=subprocess.STDOUT,
                     stdin=subprocess.DEVNULL,
                     start_new_session=hasattr(os, 'setsid'),
+                    env=_env,
                 )
                 _log_file.close()
                 register_spawned_pid(proc.pid)
