@@ -1,5 +1,24 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- **Opt-in auth-failure recovery for the ingest path** — background fact
+  extraction now detects authentication failures from the `claude_cli`
+  backend specifically (new `LLMAuthError` subclass of `LLMError`), instead
+  of collapsing them into a generic error and silently dropping the
+  session's facts. On an auth failure the `truememory-ingest ingest` command
+  exits **2** (distinct from "no backend" = 3 and "filesystem preflight" =
+  4) and re-queues the session to the backlog with `reason="cli_auth_failure"`
+  and a `retry_count`. A user-configured re-auth command — `on_auth_failure_cmd`
+  in `~/.truememory/config.json`, or the `TRUEMEMORY_ON_AUTH_FAILURE_CMD`
+  environment variable — is run once per SessionStart drain (detached and
+  bounded, never blocking startup) so the re-queued session succeeds on the
+  next attempt. A `MAX_AUTH_RETRIES` (2) guard stops the re-auth ↔ re-ingest
+  loop from running forever; exhausted markers are left in place for manual
+  recovery (never deleted, so no memories are lost). Recovery is strictly
+  opt-in — with no command configured, behaviour is a clean no-op.
+
 ## [0.6.9] — 2026-05-17
 
 ### Fixed
