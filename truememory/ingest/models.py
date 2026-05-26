@@ -97,6 +97,46 @@ class LLMError(Exception):
     pass
 
 
+class LLMAuthError(LLMError):
+    """Raised when an LLM call fails specifically because of an authentication
+    or credential problem (expired/dead OAuth token, missing login, 401).
+
+    Subclasses :class:`LLMError` so existing ``except LLMError`` handlers keep
+    catching it, but callers that want to react to auth failures specifically
+    (e.g. trigger a re-auth + re-queue) can catch ``LLMAuthError`` first.
+    """
+    pass
+
+
+# Substrings that, when present in a CLI's stderr or JSON error result, signal
+# an authentication/credential failure rather than a transient or content
+# problem. Matched case-insensitively. Kept deliberately generic so this works
+# for any one-shot CLI backend, not a specific vendor.
+_AUTH_FAILURE_SIGNALS = (
+    "not logged in",
+    "unauthorized",
+    "authentication",
+    "authenticate",
+    "invalid token",
+    "token expired",
+    "expired token",
+    "oauth",
+    "401",
+    "please run",
+    "auth login",
+    "credentials",
+)
+
+# Process exit codes that a CLI may return on a dead/expired credential when it
+# emits little or no stderr. Only treated as auth failures when the stderr is
+# empty or itself auth-ish (see ``_looks_like_auth_failure``) — a non-empty,
+# non-auth stderr with one of these codes stays a plain LLMError.
+#   1          — generic CLI failure (commonly used for "you must log in")
+#   129        — 128 + SIGHUP, seen when an auth subprocess is torn down
+#   3221225794 — 0xC0000142 on Windows (DLL init failure during a failed launch)
+_AUTH_FAILURE_RETURNCODES = {1, 129, 3221225794}
+
+
 # Retry configuration for transient network failures
 _MAX_RETRIES = 3
 _BASE_BACKOFF_SEC = 1.0
@@ -451,6 +491,20 @@ def _claude_cli_available() -> bool:
     return shutil.which("claude") is not None
 
 
+def _looks_like_auth_failure(message: str) -> bool:
+    """Return True if ``message`` contains any known auth-failure signal.
+
+    Conservative by design: matches only on the explicit substrings in
+    ``_AUTH_FAILURE_SIGNALS`` (case-insensitive). An empty/None message is
+    not, on its own, an auth failure — the return-code heuristic in the
+    caller handles the "dead token, no stderr" case.
+    """
+    if not message:
+        return False
+    lowered = message.lower()
+    return any(signal in lowered for signal in _AUTH_FAILURE_SIGNALS)
+
+
 def _complete_claude_cli(config: LLMConfig, prompt: str, system: str) -> str:
     """Complete using the local ``claude`` CLI in one-shot print mode.
 
@@ -529,6 +583,24 @@ def _complete_claude_cli(config: LLMConfig, prompt: str, system: str) -> str:
         if proc.returncode != 0:
             stderr = (proc.stderr or "").strip()[:500]
             _tele["error"] = stderr[:200] or "nonzero_exit"
+            # Classify auth failures specifically so callers can re-authenticate
+            # and re-queue instead of silently dropping the session's facts.
+            # Two signals, either of which is sufficient:
+            #   1. The stderr text matches a known auth-failure substring, OR
+            #   2. The return code is a known dead-token code AND the stderr is
+            #      empty or itself auth-ish (a non-auth stderr with that code is
+            #      treated as a plain failure to stay conservative).
+            is_auth = _looks_like_auth_failure(stderr) or (
+                proc.returncode in _AUTH_FAILURE_RETURNCODES
+                and (not stderr or _looks_like_auth_failure(stderr))
+            )
+            if is_auth:
+                _tele["auth_failure"] = True
+                log.warning("claude CLI auth failure (telemetry=%s)", _tele)
+                raise LLMAuthError(
+                    f"claude CLI auth failure (exit {proc.returncode}): "
+                    f"{stderr or 'no stderr'}"
+                )
             raise LLMError(f"claude CLI exit {proc.returncode}: {stderr or 'no stderr'}")
 
         # Parse the --output-format json envelope: {type, subtype, is_error, result, ...}
@@ -539,8 +611,16 @@ def _complete_claude_cli(config: LLMConfig, prompt: str, system: str) -> str:
             raise LLMError(f"claude CLI returned non-JSON: {proc.stdout[:300]}") from e
 
         if data.get("is_error"):
-            _tele["error"] = f"cli_reported_error:{str(data.get('result',''))[:120]}"
-            raise LLMError(f"claude CLI reported error: {data.get('result', 'unknown')}")
+            result_msg = str(data.get("result", "unknown"))
+            _tele["error"] = f"cli_reported_error:{result_msg[:120]}"
+            # The CLI can exit 0 but still report an auth problem inside the JSON
+            # envelope (e.g. is_error=true with a "please run ... login" result).
+            # Classify those as auth failures too.
+            if _looks_like_auth_failure(result_msg):
+                _tele["auth_failure"] = True
+                log.warning("claude CLI auth failure via is_error (telemetry=%s)", _tele)
+                raise LLMAuthError(f"claude CLI reported auth error: {result_msg}")
+            raise LLMError(f"claude CLI reported error: {result_msg}")
 
         result = data.get("result")
         if not isinstance(result, str):

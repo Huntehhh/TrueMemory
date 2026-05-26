@@ -27,7 +27,7 @@ import re
 import time
 from dataclasses import dataclass
 
-from truememory.ingest.models import LLMConfig, LLMError, complete
+from truememory.ingest.models import LLMConfig, LLMError, LLMAuthError, complete
 
 log = logging.getLogger(__name__)
 
@@ -225,6 +225,17 @@ def extract_facts(
                 "LLM chunk %d/%d done in %.1fs provider=%s model=%s",
                 i + 1, len(chunks), _chunk_elapsed, config.provider, config.model,
             )
+        except LLMAuthError:
+            # Auth failures are NOT per-chunk recoverable — the credential is
+            # dead, so every remaining chunk would fail the same way and the
+            # session's facts would be silently dropped. Propagate up to the
+            # ingest CLI so it can re-authenticate and re-queue the session.
+            log.error(
+                "LLM extraction hit an auth failure on chunk %d/%d (%s); "
+                "aborting extraction so the session can be re-queued",
+                i + 1, len(chunks), config.provider,
+            )
+            raise
         except LLMError as e:
             log.error(
                 "LLM extraction failed for chunk %d/%d (%s): %s",
