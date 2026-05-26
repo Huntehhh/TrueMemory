@@ -214,15 +214,22 @@ def main():
 
     try:
         input_data = json.load(sys.stdin)
-    except (json.JSONDecodeError, EOFError):
+    except (json.JSONDecodeError, EOFError, ValueError):
+        input_data = {}
+    # A valid-but-non-object payload (bare list/string/number) would make the
+    # .get() calls below raise; coerce to an empty dict so recall still runs.
+    if not isinstance(input_data, dict):
         input_data = {}
 
     try:
+        injected_ids: list = []
         if _is_first_run():
             context = _first_run_context()
             _action = "first_run_banner"
         else:
-            context = recall_memories(input_data, user_id=args.user, db_path=args.db)
+            context, injected_ids = recall_memories(
+                input_data, user_id=args.user, db_path=args.db,
+            )
             _action = "injected"
 
         # Check for available updates
@@ -247,9 +254,23 @@ def main():
                     query="blanket recall: preferences, facts, decisions, corrections, relationships",
                     memory_count=context.count("\n- "),
                     action=_action,
+                    extra={"memory_ids": injected_ids} if injected_ids else None,
                 )
             except Exception:
                 pass
+            # Seed turn-recall dedup so user_prompt_submit doesn't
+            # re-inject anything the blanket recall already showed. Also
+            # prune stale per-session dedup files here — once per session,
+            # off the per-prompt critical path.
+            if injected_ids:
+                try:
+                    from truememory.ingest.hooks import _session_dedup
+                    _session_dedup.seed_session(
+                        input_data.get("session_id", ""),
+                        injected_ids,
+                    )
+                except Exception:
+                    log.exception("session_start: dedup seed failed")
     except Exception as e:
         log.error("SessionStart hook failed: %s", e)
 
@@ -265,12 +286,19 @@ def _first_run_context() -> str:
     return "\n".join(lines)
 
 
-def recall_memories(input_data: dict, user_id: str = "", db_path: str = "") -> str:
-    """Search TrueMemory and format relevant memories for injection."""
+def recall_memories(
+    input_data: dict, user_id: str = "", db_path: str = "",
+) -> tuple[str, list]:
+    """Search TrueMemory and format relevant memories for injection.
+
+    Returns ``(context_string, injected_memory_ids)``. The ID list lets
+    ``main()`` seed the per-session turn-recall dedup file without relying
+    on module-global state.
+    """
     try:
         from truememory import Memory
     except ImportError:
-        return ""
+        return "", []
 
     db = db_path or None
     memory = Memory(path=db) if db else Memory()
@@ -325,7 +353,7 @@ def recall_memories(input_data: dict, user_id: str = "", db_path: str = "") -> s
             continue
 
     if not all_results:
-        return ""
+        return "", []
 
     lines = [
         "<truememory-context>",
@@ -334,13 +362,17 @@ def recall_memories(input_data: dict, user_id: str = "", db_path: str = "") -> s
         "Use these to answer user questions. Search TrueMemory for more if needed.",
         "",
     ]
+    injected_ids: list = []
     for r in all_results[:MEMORY_LIMIT]:
         content = r.get("content", "").strip()
         if content:
             lines.append(f"- {content}")
+            rid = r.get("id")
+            if rid is not None:
+                injected_ids.append(rid)
 
     lines.append("</truememory-context>")
-    return "\n".join(lines)
+    return "\n".join(lines), injected_ids
 
 
 if __name__ == "__main__":
