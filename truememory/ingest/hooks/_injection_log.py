@@ -103,15 +103,23 @@ def write_injection(
             "extra": extra or {},
         }
 
-        tmp = LAST_INJECTION_PATH.with_suffix(".json.tmp")
+        # PID-suffix the tmp file so two concurrent hooks (e.g., sub-agent
+        # session_start overlapping the parent's user_prompt_submit) don't
+        # clobber each other's in-flight write. Last writer's rename wins
+        # cleanly — no corruption, no partial-file ever published.
+        # Derive the tmp name from the configured path so a custom
+        # TRUEMEMORY_LAST_INJECTION_PATH keeps its sibling tmp file.
+        tmp = LAST_INJECTION_PATH.with_name(f"{LAST_INJECTION_PATH.name}.{os.getpid()}.tmp")
         tmp.write_text(json.dumps(record, indent=2), encoding="utf-8")
         tmp.replace(LAST_INJECTION_PATH)
 
         _rotate_if_needed()
-        compact = dict(record)
-        # Don't blow up the rolling log with full content — preview is enough.
-        compact.pop("full_content", None)
+        # Keep full_content in the rolling log so the history popup can show
+        # the complete injected memories un-truncated (the user asked for no
+        # truncation). The 5 MB rotation cap keeps total size bounded — at
+        # ~6 KB per session_start record that's still ~800+ records of
+        # history before the oldest rolls off.
         with INJECTIONS_LOG_PATH.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(compact) + "\n")
+            f.write(json.dumps(record) + "\n")
     except Exception:
         pass

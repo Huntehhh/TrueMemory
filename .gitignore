@@ -120,3 +120,7 @@ benchmarks/gate_eval/run_weight_threshold_sweep.py
 benchmarks/locomo/results/truememory_pro_v3_modal.json
 benchmarks/locomo/scripts/modal_benchmark.py
 benchmarks/longmemeval/data/*.json
+
+# Hunter-local handoff artifacts (not for upstream)
+_HApps-global-context-tracker-handoffs/
+
