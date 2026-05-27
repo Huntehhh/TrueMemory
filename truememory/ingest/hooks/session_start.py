@@ -27,6 +27,12 @@ import os
 import sys
 from pathlib import Path
 
+try:
+    import fcntl
+    _HAS_FCNTL = True
+except ImportError:
+    _HAS_FCNTL = False
+
 log = logging.getLogger(__name__)
 
 MEMORY_LIMIT = int(os.environ.get("TRUEMEMORY_RECALL_LIMIT", "25"))
@@ -42,6 +48,16 @@ BACKLOG_DIR = Path.home() / ".truememory" / "backlog"
 # actually controls.
 _BACKLOG_BATCH_SIZE = max(0, int(os.environ.get("TRUEMEMORY_BACKLOG_BATCH_SIZE", "3")))
 _DRAIN_CAP = _BACKLOG_BATCH_SIZE  # backward-compat alias
+
+_SCAN_MARKER = Path.home() / ".truememory" / ".last_stale_scan"
+_SCAN_INTERVAL = 900  # 15 minutes
+_SCAN_CAP = 3  # max sessions to queue per scan
+
+_EXTRACTION_SENTINEL = "[[TRUEMEMORY_INTERNAL_EXTRACTION]]"
+_EXTRACTION_LEGACY_PREFIXES = (
+    "You are a memory extraction system",
+    "You are comparing a NEW fact",
+)
 
 BANNER = r"""
 ████████╗██████╗ ██╗   ██╗███████╗    ███╗   ███╗███████╗███╗   ███╗ ██████╗ ██████╗ ██╗   ██╗
@@ -151,6 +167,9 @@ def _drain_backlog() -> None:
     the avalanche scenario where N concurrent SessionStart hooks all drain
     simultaneously, spawning N × _BACKLOG_BATCH_SIZE ingest processes.
 
+    Uses atomic rename (.json → .processing) to prevent TOCTOU races where
+    multiple drainers read the same marker before either acquires the flock.
+
     Tunable via ``TRUEMEMORY_BACKLOG_BATCH_SIZE`` env var (default 3). Set
     to 1 to fully serialize the catch-up — useful when many SessionStarts
     arrive in rapid succession (each draining 3 sessions otherwise causes
@@ -162,6 +181,10 @@ def _drain_backlog() -> None:
         return
     if not BACKLOG_DIR.exists():
         return
+
+    from truememory.ingest.hooks._shared import cleanup_stale_processing, check_extraction_budget, record_stale_processing_pid
+    cleanup_stale_processing(BACKLOG_DIR)
+
     try:
         markers = sorted(BACKLOG_DIR.glob("*.json"))[:_BACKLOG_BATCH_SIZE]
     except Exception:
@@ -170,16 +193,34 @@ def _drain_backlog() -> None:
     from truememory.hooks.core import spawn_gate, register_spawned_pid
 
     for marker_path in markers:
+        claimed_path = marker_path.with_suffix(".processing")
         try:
-            data = json.loads(marker_path.read_text(encoding="utf-8"))
+            marker_path.rename(claimed_path)
+        except (FileNotFoundError, OSError):
+            continue
+
+        try:
+            data = json.loads(claimed_path.read_text(encoding="utf-8"))
             transcript = data.get("transcript_path", "")
             if not transcript or not Path(transcript).exists():
-                marker_path.unlink(missing_ok=True)
+                claimed_path.unlink(missing_ok=True)
                 continue
+
+            if not check_extraction_budget():
+                log.info("Drain: extraction budget exhausted, leaving backlog for next hour")
+                try:
+                    claimed_path.rename(marker_path)
+                except OSError:
+                    pass
+                return
 
             with spawn_gate() as allowed:
                 if not allowed:
                     log.info("Drain: spawn cap reached, leaving remaining backlog for next session")
+                    try:
+                        claimed_path.rename(marker_path)
+                    except OSError:
+                        pass
                     return
 
                 import subprocess
@@ -194,23 +235,173 @@ def _drain_backlog() -> None:
                     cmd.extend(["--user", data["user_id"]])
                 if data.get("db_path"):
                     cmd.extend(["--db", data["db_path"]])
+                from truememory.ingest.hooks._shared import _safe_session_id
+                _log_dir = Path.home() / ".truememory" / "logs"
+                _log_dir.mkdir(parents=True, exist_ok=True)
+                _safe_sid = _safe_session_id(data.get('session_id', 'unknown')) or 'unknown'
+                _log_file = open(
+                    _log_dir / f"{_safe_sid}.log",
+                    "a", encoding="utf-8",
+                )
                 proc = subprocess.Popen(
                     cmd,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    start_new_session=True,
+                    stdout=_log_file,
+                    stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL,
+                    start_new_session=hasattr(os, 'setsid'),
                 )
+                _log_file.close()
                 register_spawned_pid(proc.pid)
-            marker_path.unlink(missing_ok=True)
+                record_stale_processing_pid(claimed_path, proc.pid)
+            claimed_path.unlink(missing_ok=True)
             log.info("Drained backlog session: %s", data.get("session_id", "?"))
         except Exception as e:
+            try:
+                claimed_path.rename(marker_path)
+            except OSError:
+                pass
             log.debug("Failed to drain backlog entry %s: %s", marker_path.name, e)
 
 
+def _is_extraction_transcript(transcript_path: Path) -> bool:
+    """Check if a transcript is TrueMemory extraction noise, not a real conversation.
+
+    Looks for the structured sentinel tag or legacy extraction prompt prefixes
+    in the first user message. Reads only the first 30 lines of the file.
+    """
+    try:
+        with open(transcript_path, "r", encoding="utf-8", errors="replace") as f:
+            for i, line in enumerate(f):
+                if i > 30:
+                    break
+                try:
+                    data = json.loads(line)
+                    if data.get("type") != "user":
+                        continue
+                    msg = data.get("message", {})
+                    content = msg.get("content", "") if isinstance(msg, dict) else str(msg)
+                    if isinstance(content, list):
+                        content = content[0].get("text", "") if content else ""
+                    if _EXTRACTION_SENTINEL in content:
+                        return True
+                    for prefix in _EXTRACTION_LEGACY_PREFIXES:
+                        if content.startswith(prefix):
+                            return True
+                    return False
+                except (json.JSONDecodeError, KeyError, TypeError):
+                    continue
+    except OSError:
+        pass
+    return False
+
+
+def _scan_stale_sessions() -> None:
+    """Find transcripts from recent sessions that were never extracted.
+
+    Runs at most once per _SCAN_INTERVAL. Scans Claude Code's project
+    directories for session transcripts modified in the last 24 hours
+    that have no corresponding extraction marker. Skips extraction noise
+    transcripts (identified by sentinel tag or legacy prompt prefixes).
+    """
+    import time
+    import re
+
+    _SCAN_MARKER.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        scan_fd = os.open(str(_SCAN_MARKER), os.O_RDWR | os.O_CREAT)
+        if _HAS_FCNTL:
+            fcntl.flock(scan_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (BlockingIOError, OSError):
+        return
+
+    try:
+        try:
+            if _SCAN_MARKER.exists():
+                if time.time() - _SCAN_MARKER.stat().st_mtime < _SCAN_INTERVAL:
+                    return
+            os.lseek(scan_fd, 0, os.SEEK_SET)
+            os.ftruncate(scan_fd, 0)
+            os.write(scan_fd, str(time.time()).encode("utf-8"))
+        except OSError:
+            return
+
+        claude_dir = Path.home() / ".claude" / "projects"
+        if not claude_dir.exists():
+            return
+
+        from truememory.ingest.hooks._shared import EXTRACTED_DIR, _safe_session_id, mark_session_extracted
+        from truememory.ingest.hooks.stop import _queue_to_backlog
+
+        uuid_re = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
+        cutoff = time.time() - 86400
+        queued = 0
+        skipped_noise = 0
+
+        for project_dir in claude_dir.iterdir():
+            if not project_dir.is_dir():
+                continue
+            for transcript in project_dir.iterdir():
+                if transcript.suffix != ".jsonl":
+                    continue
+                if not transcript.is_file():
+                    continue
+                session_id = transcript.stem
+                if not uuid_re.match(session_id):
+                    continue
+                try:
+                    stat = transcript.stat()
+                    if stat.st_mtime < cutoff:
+                        continue
+                    if stat.st_size < 5000:
+                        continue
+                except OSError:
+                    continue
+
+                safe_id = _safe_session_id(session_id)
+                if not safe_id:
+                    continue
+
+                marker = EXTRACTED_DIR / safe_id
+                if marker.exists():
+                    continue
+
+                if _is_extraction_transcript(transcript):
+                    try:
+                        mark_session_extracted(session_id, str(transcript))
+                    except Exception:
+                        pass
+                    skipped_noise += 1
+                    continue
+
+                _queue_to_backlog(
+                    str(transcript), session_id, "", "",
+                    reason="stale_session_recovery",
+                )
+                queued += 1
+                if queued >= _SCAN_CAP:
+                    break
+            if queued >= _SCAN_CAP:
+                break
+
+        if queued > 0:
+            log.info("Stale session scanner: queued %d unextracted sessions", queued)
+        if skipped_noise > 0:
+            log.info("Stale session scanner: skipped %d extraction noise transcripts", skipped_noise)
+    finally:
+        try:
+            os.close(scan_fd)
+        except OSError:
+            pass
+
+
 def main():
+    if os.environ.get("TRUEMEMORY_EXTRACTION"):
+        return
+
     args = _parse_args()
 
     _drain_backlog()
+    _scan_stale_sessions()
 
     try:
         input_data = json.load(sys.stdin)

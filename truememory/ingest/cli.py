@@ -131,6 +131,12 @@ def _run_ingest(args):
     level = logging.DEBUG if args.verbose else logging.INFO
     logging.basicConfig(level=level, format="%(levelname)s %(message)s")
 
+    try:
+        from truememory.model_client import ensure_server_running
+        ensure_server_running()
+    except Exception as e:
+        logging.getLogger(__name__).debug("Model server not available: %s", e)
+
     # Preflight: verify truememory is importable before we try to
     # construct a pipeline. This catches missing dependencies early with
     # an actionable error instead of a deep ModuleNotFoundError.
@@ -244,6 +250,12 @@ def _run_ingest(args):
     if args.trace:
         save_trace(result, args.trace)
 
+    try:
+        from truememory.ingest.hooks._shared import mark_session_extracted
+        mark_session_extracted(args.session, args.transcript)
+    except Exception:
+        pass
+
     _cascade_next()
 
 
@@ -254,12 +266,18 @@ def _cascade_next() -> None:
     next one before exiting. The chain terminates naturally when the
     backlog is empty or the spawn cap is reached. SessionStart hooks
     act as a backup kickstarter if the chain breaks.
+
+    Uses atomic rename (.json → .processing) to prevent TOCTOU races where
+    multiple drainers read the same marker before either acquires the flock.
     """
     import subprocess as _sp
 
     backlog_dir = Path.home() / ".truememory" / "backlog"
     if not backlog_dir.exists():
         return
+
+    from truememory.ingest.hooks._shared import cleanup_stale_processing, check_extraction_budget, record_stale_processing_pid
+    cleanup_stale_processing(backlog_dir)
 
     try:
         markers = sorted(backlog_dir.glob("*.json"))
@@ -275,16 +293,33 @@ def _cascade_next() -> None:
         return
 
     for marker_path in markers[:1]:
+        claimed_path = marker_path.with_suffix(".processing")
+        try:
+            marker_path.rename(claimed_path)
+        except (FileNotFoundError, OSError):
+            continue
+
         try:
             import json as _json
-            data = _json.loads(marker_path.read_text(encoding="utf-8"))
+            data = _json.loads(claimed_path.read_text(encoding="utf-8"))
             transcript = data.get("transcript_path", "")
             if not transcript or not Path(transcript).exists():
-                marker_path.unlink(missing_ok=True)
+                claimed_path.unlink(missing_ok=True)
                 continue
+
+            if not check_extraction_budget():
+                try:
+                    claimed_path.rename(marker_path)
+                except OSError:
+                    pass
+                return
 
             with spawn_gate() as allowed:
                 if not allowed:
+                    try:
+                        claimed_path.rename(marker_path)
+                    except OSError:
+                        pass
                     return
 
                 cmd = [
@@ -302,17 +337,21 @@ def _cascade_next() -> None:
                     cmd,
                     stdout=_sp.DEVNULL,
                     stderr=_sp.DEVNULL,
-                    start_new_session=True,
+                    start_new_session=hasattr(os, 'setsid'),
                 )
                 register_spawned_pid(proc.pid)
+                record_stale_processing_pid(claimed_path, proc.pid)
 
-            marker_path.unlink(missing_ok=True)
+            claimed_path.unlink(missing_ok=True)
             logging.getLogger(__name__).info(
                 "Cascade: spawned next ingest for session %s (PID %d)",
                 data.get("session_id", "?"), proc.pid,
             )
         except Exception:
-            pass
+            try:
+                claimed_path.rename(marker_path)
+            except OSError:
+                pass
 
 
 def _preflight_writable_target(target: str | None, *, kind: str) -> bool:
@@ -653,15 +692,27 @@ def _run_upgrade_tier(args):
         print(f"Already on {tier} tier. Use --force to re-embed anyway.")
         return
 
+    from truememory.tier_switch.cache import get_transition_action
+
+    action = get_transition_action(old_tier, tier, force=args.force)
+
+    if action == "noop":
+        print(f"Already on {tier} tier.")
+        return
+
+    if action == "config_only":
+        config["tier"] = tier
+        _save_truememory_config(config)
+        os.environ["TRUEMEMORY_EMBED_MODEL"] = tier
+        from truememory.vector_search import set_embedding_model
+        set_embedding_model(tier)
+        from truememory.reranker import set_active_tier
+        set_active_tier(tier)
+        print(f"\033[32m✓ Switched to {tier} instantly (same embedding model)\033[0m")
+        return
+
     print(f"Switching from {old_tier} to {tier}...")
 
-    # Save tier to config
-    config["tier"] = tier
-    _save_truememory_config(config)
-
-    # Switch active models and re-embed.
-    # All models are pre-downloaded during install — this just switches
-    # which one is active and re-embeds existing memories.
     os.environ.pop("HF_HUB_OFFLINE", None)
     os.environ.pop("TRANSFORMERS_OFFLINE", None)
     try:
@@ -672,31 +723,33 @@ def _run_upgrade_tier(args):
         from truememory.reranker import set_active_tier
         set_active_tier(tier)
 
-        from truememory import Memory
-        mem = Memory()
-        engine = mem._engine
-        engine._ensure_connection()
-        conn = engine.conn
-        count = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+        from truememory.tier_switch.manager import RebuildManager
 
-        if count > 0:
-            print(f"  Re-embedding {count} memories with {tier} model...")
-            conn.execute("DROP TABLE IF EXISTS vec_messages")
-            conn.execute("DROP TABLE IF EXISTS vec_messages_sep")
-            conn.commit()
-            from truememory.vector_search import (
-                build_separation_vectors,
-                build_vectors,
-                init_vec_table,
+        def progress_callback(processed, total, metrics):
+            pct = metrics.get("progress_pct", 0)
+            eta = metrics.get("eta_seconds", 0)
+            bs = metrics.get("batch_size", 0)
+            ram = metrics.get("ram_pct", 0)
+            print(
+                f"\r  Re-embedding: {pct:.0f}% ({processed}/{total}) "
+                f"| ETA {eta:.0f}s | BS={bs} | RAM={ram:.0f}%",
+                end="", flush=True,
             )
-            init_vec_table(conn)
-            build_vectors(conn)
-            build_separation_vectors(conn)
-            print(f"  \033[32m✓ {count} memories re-embedded\033[0m")
+
+        manager = RebuildManager()
+        success = manager.run_rebuild_sync(
+            target_tier=tier,
+            force=args.force,
+            progress_callback=progress_callback,
+        )
+
+        if success:
+            print(f"\n  \033[32m✓ Tier switched to {tier}\033[0m")
         else:
-            print("  No existing memories to re-embed.")
+            print("\n  \033[31m✗ Rebuild failed. Run again to retry.\033[0m")
+            sys.exit(1)
     except Exception as e:
-        print(f"\033[31mError during tier switch: {e}\033[0m", file=sys.stderr)
+        print(f"\n\033[31mError during tier switch: {e}\033[0m", file=sys.stderr)
         print("Config was saved. Re-run to retry, or use truememory-ingest setup.")
         sys.exit(1)
     finally:
@@ -805,8 +858,19 @@ def _run_install(args):
     import shlex
     py = sys.executable
 
+    _HOOK_MODULES = {
+        "session_start.py": "truememory.ingest.hooks.session_start",
+        "user_prompt_submit.py": "truememory.ingest.hooks.user_prompt_submit",
+        "stop.py": "truememory.ingest.hooks.stop",
+        "compact.py": "truememory.ingest.hooks.compact",
+    }
+
     def _build_command(hook_path: Path) -> str:
-        parts: list[str] = [py, str(hook_path)]
+        module = _HOOK_MODULES.get(hook_path.name)
+        if module:
+            parts: list[str] = [py, "-m", module]
+        else:
+            parts = [py, str(hook_path)]
         if args.user:
             parts.extend(["--user", args.user])
         if args.db:
@@ -933,7 +997,13 @@ def _run_install(args):
             if not already_present:
                 existing["hooks"][event].append(hook)
 
-    settings_path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+    settings_tmp = settings_path.with_suffix(".json.tmp")
+    settings_tmp.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+    try:
+        settings_tmp.replace(settings_path)
+    except OSError:
+        settings_path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+        settings_tmp.unlink(missing_ok=True)
     print(f"Hooks installed in {settings_path}")
     print(f"Events configured: {', '.join(settings['hooks'].keys())}")
 
@@ -999,7 +1069,8 @@ def _merge_claude_md(template_path: Path, target_path: Path) -> None:
 
     # Back up the existing file before mutating it
     if existing and target_path.exists():
-        backup_path = target_path.with_suffix(".md.bak")
+        import time as _time
+        backup_path = target_path.with_name(f"CLAUDE.md.bak.{int(_time.time())}")
         try:
             backup_path.write_text(existing, encoding="utf-8")
         except OSError:

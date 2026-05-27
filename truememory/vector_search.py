@@ -103,12 +103,78 @@ def _resolve_model_name(name: str) -> str:
     return _TIER_ALIASES.get(lowered, name)
 
 
-_raw_env = os.environ.get("TRUEMEMORY_EMBED_MODEL", "edge")
+def resolve_tier() -> str:
+    """Resolve the active tier: env var → config.json → ``'edge'``.
+
+    Canonical tier resolver for the entire codebase.  Every call site
+    that formerly did ``os.environ.get("TRUEMEMORY_EMBED_MODEL", "edge")``
+    should call this instead so that ``~/.truememory/config.json`` is
+    honoured when the env var is absent.
+    """
+    env = os.environ.get("TRUEMEMORY_EMBED_MODEL", "").strip().lower()
+    if env:
+        return env
+    try:
+        import json
+        from pathlib import Path
+        _cfg = Path.home() / ".truememory" / "config.json"
+        if _cfg.exists():
+            tier = json.loads(_cfg.read_text(encoding="utf-8")).get("tier", "")
+            if tier:
+                return tier.strip().lower()
+    except Exception:
+        pass
+    return "edge"
+
+_raw_env = resolve_tier()
 EMBEDDING_MODEL = _resolve_model_name(_raw_env)
 
 _model = None
 _embedding_dim: int = _MODEL_DIMS.get(EMBEDDING_MODEL, 256)
 _lock = threading.Lock()
+
+_MODEL_TO_GROUP = {
+    "model2vec": "edge",
+    "qwen3_256": "basepro",
+    "minilm": "basepro",
+    "bge-small": "basepro",
+}
+_VALID_GROUPS = frozenset({"edge", "basepro"})
+
+
+def _active_tier_group() -> str:
+    """Map the current embedding model to its tier group."""
+    return _MODEL_TO_GROUP.get(EMBEDDING_MODEL, "basepro")
+
+
+def _active_vec_table(conn: sqlite3.Connection) -> str:
+    """Return the active vec_messages table name for the current tier."""
+    try:
+        group = _active_tier_group()
+        row = conn.execute(
+            "SELECT vec_table FROM vector_cache_registry WHERE tier_group = ?",
+            (group,),
+        ).fetchone()
+        if row:
+            return row[0]
+    except sqlite3.OperationalError:
+        pass
+    return "vec_messages"
+
+
+def _active_sep_table(conn: sqlite3.Connection) -> str:
+    """Return the active vec_messages_sep table name for the current tier."""
+    try:
+        group = _active_tier_group()
+        row = conn.execute(
+            "SELECT sep_table FROM vector_cache_registry WHERE tier_group = ?",
+            (group,),
+        ).fetchone()
+        if row:
+            return row[0]
+    except sqlite3.OperationalError:
+        pass
+    return "vec_messages_sep"
 
 
 def set_embedding_model(name: str) -> None:
@@ -137,13 +203,32 @@ def unload_model() -> None:
 
 
 def get_model():
-    """Lazy-load the embedding model (singleton)."""
+    """Lazy-load the embedding model (singleton).
+
+    When the shared model server is enabled (default), returns a proxy
+    that routes inference to the server process. Falls back to local
+    loading if the server is unavailable.
+    """
     global _model, _embedding_dim
     if _model is not None:
         return _model  # Fast path, no lock needed
     with _lock:
         if _model is not None:
             return _model  # Another thread loaded it
+
+        from truememory.model_client import use_model_server, get_embedding_proxy
+        if use_model_server():
+            try:
+                proxy = get_embedding_proxy(tier=EMBEDDING_MODEL)
+                _model = proxy
+                return _model
+            except Exception:
+                logger.warning(
+                    "Model server available but embedding proxy failed — "
+                    "falling back to local model loading (high memory cost). "
+                    "Check ~/.truememory/model_server.stderr for details."
+                )
+
         resolved = EMBEDDING_MODEL
         if resolved == "model2vec":
             from model2vec import StaticModel
@@ -231,13 +316,23 @@ def _read_embedder_metadata(
     return model, dim
 
 
-def _detect_existing_vec_dim(conn: sqlite3.Connection) -> int | None:
-    """Parse the dimension declared in an existing `vec_messages` schema."""
+def _detect_existing_vec_dim(
+    conn: sqlite3.Connection, table_name: str | None = None
+) -> int | None:
+    """Parse the dimension declared in an existing vector table schema."""
+    name = table_name or _active_vec_table(conn)
     row = conn.execute(
-        "SELECT sql FROM sqlite_master WHERE name='vec_messages'"
+        "SELECT sql FROM sqlite_master WHERE name = ?", (name,)
     ).fetchone()
     if not row or not row[0]:
-        return None
+        if name != "vec_messages":
+            row = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE name='vec_messages'"
+            ).fetchone()
+            if not row or not row[0]:
+                return None
+        else:
+            return None
     match = re.search(r"float\[(\d+)\]", row[0])
     return int(match.group(1)) if match else None
 
@@ -253,7 +348,7 @@ def _migration_hint() -> str:
 def _check_embedder_compatibility(conn: sqlite3.Connection) -> None:
     """Guard against silent dim- or model-mismatch when a vec table exists.
 
-    Called from :func:`init_vec_table`. Skips when `vec_messages` is absent
+    Called from :func:`init_vec_table`. Skips when no vector table is found
     so that explicit re-embed flows (truememory_configure dropping + rebuilding)
     aren't blocked by stale metadata from the previous embedder.
     """
@@ -330,23 +425,24 @@ def serialize_f32(vector) -> bytes:
 # Table initialization
 # ---------------------------------------------------------------------------
 
-def init_vec_table(conn: sqlite3.Connection) -> None:
+def init_vec_table(
+    conn: sqlite3.Connection, *, tier_group: str | None = None
+) -> None:
     """
     Initialize the sqlite-vec extension and create both vector tables.
 
-    Creates two virtual tables:
-    - ``vec_messages`` -- completion embeddings (semantic similarity)
-    - ``vec_messages_sep`` -- separation embeddings (with metadata for
-      distinguishing similar messages)
+    Creates two virtual tables for embeddings keyed by ``rowid``
+    matching ``messages.id``. When *tier_group* is provided the tables
+    are named ``vec_messages_{tier_group}`` / ``vec_messages_sep_{tier_group}``
+    for the tier-switch cache system; otherwise the active table names
+    are resolved from the vector cache registry (falling back to the
+    generic ``vec_messages`` / ``vec_messages_sep``).
 
-    Both store 256-dimensional float32 embeddings keyed by ``rowid``
-    which must correspond to ``messages.id``.
-
-    This function is idempotent -- calling it on an already-initialized
-    database is safe (``CREATE VIRTUAL TABLE IF NOT EXISTS``).
+    This function is idempotent.
 
     Args:
         conn: An open SQLite connection (from :func:`truememory.storage.create_db`).
+        tier_group: Optional explicit tier group name ("edge" or "basepro").
     """
     import sqlite_vec
 
@@ -355,17 +451,24 @@ def init_vec_table(conn: sqlite3.Connection) -> None:
     conn.enable_load_extension(False)
 
     _ensure_metadata_table(conn)
-    _check_embedder_compatibility(conn)
+
+    if tier_group:
+        if tier_group not in _VALID_GROUPS:
+            raise ValueError(f"Invalid tier_group: {tier_group!r}")
+        vec_name = f"vec_messages_{tier_group}"
+        sep_name = f"vec_messages_sep_{tier_group}"
+    else:
+        _check_embedder_compatibility(conn)
+        vec_name = _active_vec_table(conn)
+        sep_name = _active_sep_table(conn)
 
     dim = _embedding_dim
-    # Completion embeddings (semantic similarity)
     conn.execute(
-        f"CREATE VIRTUAL TABLE IF NOT EXISTS vec_messages "
+        f"CREATE VIRTUAL TABLE IF NOT EXISTS {vec_name} "
         f"USING vec0(embedding float[{dim}])"
     )
-    # Separation embeddings (uniqueness, with metadata)
     conn.execute(
-        f"CREATE VIRTUAL TABLE IF NOT EXISTS vec_messages_sep "
+        f"CREATE VIRTUAL TABLE IF NOT EXISTS {sep_name} "
         f"USING vec0(embedding float[{dim}])"
     )
     conn.commit()
@@ -406,9 +509,11 @@ def _flush_mps_cache() -> None:
 def build_vectors(
     conn: sqlite3.Connection,
     messages: list[dict] | None = None,
+    *,
+    table_name: str | None = None,
 ) -> int:
     """
-    Embed messages and store their vectors in the ``vec_messages`` table.
+    Embed messages and store their vectors in a vector table.
 
     If *messages* is ``None`` the function reads every row from the
     ``messages`` table.  Otherwise it uses the supplied list (each dict must
@@ -419,10 +524,11 @@ def build_vectors(
     MPS cache is flushed between batches to prevent memory accumulation.
 
     Args:
-        conn:     Open database connection with sqlite-vec already loaded
-                  (call :func:`init_vec_table` first).
-        messages: Optional pre-fetched list of message dicts.  When omitted,
-                  messages are read from the database.
+        conn:       Open database connection with sqlite-vec already loaded
+                    (call :func:`init_vec_table` first).
+        messages:   Optional pre-fetched list of message dicts.
+        table_name: Target vector table. Defaults to the active table for
+                    the current tier group.
 
     Returns:
         Number of vectors inserted.
@@ -436,7 +542,8 @@ def build_vectors(
     if not messages:
         return 0
 
-    conn.execute("DELETE FROM vec_messages")
+    tbl = table_name or _active_vec_table(conn)
+    conn.execute(f"DELETE FROM {tbl}")
 
     model = get_model()
     batch_size = _get_batch_size()
@@ -458,7 +565,7 @@ def build_vectors(
             embeddings = model.encode(texts, show_progress_bar=False)
 
             conn.executemany(
-                "INSERT INTO vec_messages(rowid, embedding) VALUES (?, ?)",
+                f"INSERT INTO {tbl}(rowid, embedding) VALUES (?, ?)",
                 [(mid, serialize_f32(emb)) for mid, emb in zip(ids, embeddings)],
             )
 
@@ -518,16 +625,15 @@ def search_vector(
 
     query_blob = _query_blob
 
-    # sqlite-vec requires k=? in WHERE clause for KNN queries.
-    # We do the KNN search first, then JOIN with messages for full data.
+    tbl = _active_vec_table(conn)
     rows = conn.execute(
-        """
+        f"""
         SELECT v.rowid, v.distance,
                m.content, m.sender, m.recipient,
                m.timestamp, m.category, m.modality
         FROM (
             SELECT rowid, distance
-            FROM vec_messages
+            FROM {tbl}
             WHERE embedding MATCH ? AND k = ?
         ) v
         JOIN messages m ON m.id = v.rowid
@@ -573,14 +679,15 @@ def search_vector_raw(
     query_embedding = model.encode([query])[0]
     query_blob = serialize_f32(query_embedding)
 
+    tbl = _active_vec_table(conn)
     rows = conn.execute(
-        """
+        f"""
         SELECT v.rowid, v.distance,
                m.content, m.sender, m.recipient,
                m.timestamp, m.category, m.modality
         FROM (
             SELECT rowid, distance
-            FROM vec_messages
+            FROM {tbl}
             WHERE embedding MATCH ? AND k = ?
         ) v
         JOIN messages m ON m.id = v.rowid
@@ -617,6 +724,8 @@ def search_vector_raw(
 def build_separation_vectors(
     conn: sqlite3.Connection,
     messages: list[dict] | None = None,
+    *,
+    table_name: str | None = None,
 ) -> int:
     """
     Build separation embeddings: ``"{sender} to {recipient} on {date}: {content}"``.
@@ -632,9 +741,11 @@ def build_separation_vectors(
     ``"timestamp"`` keys).
 
     Args:
-        conn:     Open database connection with sqlite-vec loaded
-                  (call :func:`init_vec_table` first).
-        messages: Optional pre-fetched list of message dicts.
+        conn:       Open database connection with sqlite-vec loaded
+                    (call :func:`init_vec_table` first).
+        messages:   Optional pre-fetched list of message dicts.
+        table_name: Target separation vector table. Defaults to the active
+                    table for the current tier group.
 
     Returns:
         Number of separation vectors inserted.
@@ -651,7 +762,8 @@ def build_separation_vectors(
     if not messages:
         return 0
 
-    conn.execute("DELETE FROM vec_messages_sep")
+    tbl = table_name or _active_sep_table(conn)
+    conn.execute(f"DELETE FROM {tbl}")
 
     model = get_model()
     batch_size = _get_batch_size()
@@ -681,7 +793,7 @@ def build_separation_vectors(
             embeddings = model.encode(texts, show_progress_bar=False)
 
             conn.executemany(
-                "INSERT INTO vec_messages_sep(rowid, embedding) VALUES (?, ?)",
+                f"INSERT INTO {tbl}(rowid, embedding) VALUES (?, ?)",
                 [(mid, serialize_f32(emb)) for mid, emb in zip(ids, embeddings)],
             )
 
@@ -717,8 +829,9 @@ def embed_single(conn: sqlite3.Connection, message_id: int, content: str) -> Non
     """
     model = get_model()
     embedding = model.encode([content])[0]  # shape (dim,)
+    vec_tbl = _active_vec_table(conn)
     conn.execute(
-        "INSERT INTO vec_messages(rowid, embedding) VALUES (?, ?)",
+        f"INSERT INTO {vec_tbl}(rowid, embedding) VALUES (?, ?)",
         (message_id, serialize_f32(embedding)),
     )
 
@@ -730,12 +843,13 @@ def embed_single(conn: sqlite3.Connection, message_id: int, content: str) -> Non
         if row:
             sep_text = _build_sep_text(row[0], row[1], row[2], content)
             sep_embedding = model.encode([sep_text])[0]
+            sep_tbl = _active_sep_table(conn)
             conn.execute(
-                "INSERT INTO vec_messages_sep(rowid, embedding) VALUES (?, ?)",
+                f"INSERT INTO {sep_tbl}(rowid, embedding) VALUES (?, ?)",
                 (message_id, serialize_f32(sep_embedding)),
             )
     except Exception:
-        logger.debug("Failed to create separation vector for message %d", message_id, exc_info=True)
+        logger.warning("Failed to create separation vector for message %d", message_id, exc_info=True)
     # Caller is responsible for committing
 
 
@@ -781,14 +895,15 @@ def search_vector_separation(
         query_embedding = model.encode([query])[0]
         query_blob = serialize_f32(query_embedding)
 
+    sep_tbl = _active_sep_table(conn)
     rows = conn.execute(
-        """
+        f"""
         SELECT v.rowid, v.distance,
                m.content, m.sender, m.recipient,
                m.timestamp, m.category, m.modality
         FROM (
             SELECT rowid, distance
-            FROM vec_messages_sep
+            FROM {sep_tbl}
             WHERE embedding MATCH ? AND k = ?
         ) v
         JOIN messages m ON m.id = v.rowid
@@ -813,3 +928,95 @@ def search_vector_separation(
         })
 
     return results
+
+
+# ---------------------------------------------------------------------------
+# Legacy migration (generic → tier-specific table names)
+# ---------------------------------------------------------------------------
+
+def migrate_legacy_vec_tables(conn: sqlite3.Connection) -> bool:
+    """One-time migration: copy generic vec tables to tier-specific names.
+
+    Detects whether the old generic ``vec_messages`` / ``vec_messages_sep``
+    tables exist and copies their data into the tier-specific tables for
+    the correct tier group (determined from stored metadata, defaulting to
+    edge since pre-tier-switch versions used Model2Vec).  Populates the
+    ``vector_cache_registry`` so future operations use the new names.
+
+    Always registers the edge group for legacy tables so switch-back works.
+
+    Returns True if migration occurred, False if nothing to migrate.
+    """
+    from truememory.tier_switch.cache import VectorCacheRegistry
+
+    has_old = conn.execute(
+        "SELECT name FROM sqlite_master WHERE name='vec_messages' AND type='table'"
+    ).fetchone()
+    if not has_old:
+        return False
+
+    stored_model, _ = _read_embedder_metadata(conn)
+    group = _MODEL_TO_GROUP.get(stored_model, "edge")
+    if group not in _VALID_GROUPS:
+        group = "edge"
+
+    new_vec = f"vec_messages_{group}"
+    new_sep = f"vec_messages_sep_{group}"
+
+    count = conn.execute("SELECT COUNT(*) FROM vec_messages").fetchone()[0]
+    if count == 0:
+        conn.execute("DROP TABLE IF EXISTS vec_messages")
+        conn.execute("DROP TABLE IF EXISTS vec_messages_sep")
+        conn.commit()
+        return True
+
+    dim = _detect_existing_vec_dim(conn, "vec_messages") or 256
+
+    import sqlite_vec
+
+    conn.enable_load_extension(True)
+    sqlite_vec.load(conn)
+    conn.enable_load_extension(False)
+
+    conn.execute(
+        f"CREATE VIRTUAL TABLE IF NOT EXISTS {new_vec} "
+        f"USING vec0(embedding float[{dim}])"
+    )
+    conn.execute(
+        f"CREATE VIRTUAL TABLE IF NOT EXISTS {new_sep} "
+        f"USING vec0(embedding float[{dim}])"
+    )
+
+    conn.execute(f"INSERT INTO {new_vec} SELECT * FROM vec_messages")
+    try:
+        conn.execute(f"INSERT INTO {new_sep} SELECT * FROM vec_messages_sep")
+    except sqlite3.OperationalError:
+        pass
+
+    conn.execute("DROP TABLE vec_messages")
+    try:
+        conn.execute("DROP TABLE vec_messages_sep")
+    except sqlite3.OperationalError:
+        pass
+
+    max_id = conn.execute(
+        f"SELECT MAX(rowid) FROM {new_vec}"
+    ).fetchone()[0] or 0
+
+    model_map = {"edge": "potion-base-8M", "basepro": "Qwen3-Embedding-0.6B"}
+    VectorCacheRegistry.set(
+        conn,
+        group,
+        vec_table=new_vec,
+        sep_table=new_sep,
+        last_embedded_id=max_id,
+        vector_count=count,
+        model_name=model_map.get(group, "potion-base-8M"),
+        embedding_dim=dim,
+    )
+
+    logger.info(
+        "Migrated %d vectors from vec_messages → %s (group=%s)",
+        count, new_vec, group,
+    )
+    return True

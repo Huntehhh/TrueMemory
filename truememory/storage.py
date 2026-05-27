@@ -14,8 +14,12 @@ Schema overview:
 """
 
 import json
+import logging
 import sqlite3
+import time
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -167,6 +171,43 @@ CREATE INDEX IF NOT EXISTS idx_summaries_entity ON summaries(entity);
 CREATE INDEX IF NOT EXISTS idx_summaries_period ON summaries(period);
 CREATE INDEX IF NOT EXISTS idx_entity_relationships_a ON entity_relationships(entity_a);
 CREATE INDEX IF NOT EXISTS idx_landmark_events_timestamp ON landmark_events(timestamp);
+
+-- Vector cache registry (tier-switch: tracks per-tier-group vector table state)
+CREATE TABLE IF NOT EXISTS vector_cache_registry (
+    tier_group TEXT PRIMARY KEY,
+    vec_table TEXT NOT NULL,
+    sep_table TEXT NOT NULL,
+    last_embedded_id INTEGER DEFAULT 0,
+    vector_count INTEGER DEFAULT 0,
+    model_name TEXT,
+    embedding_dim INTEGER DEFAULT 256,
+    last_updated REAL,
+    created REAL
+);
+
+-- Rebuild status (tier-switch: tracks async rebuild progress)
+CREATE TABLE IF NOT EXISTS rebuild_status (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tier_group TEXT NOT NULL,
+    target_tier TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    action TEXT,
+    total_messages INTEGER DEFAULT 0,
+    processed_messages INTEGER DEFAULT 0,
+    progress_pct REAL DEFAULT 0,
+    eta_seconds REAL DEFAULT 0,
+    batch_size INTEGER DEFAULT 0,
+    throughput_ips REAL DEFAULT 0,
+    ram_pct REAL DEFAULT 0,
+    pressure REAL DEFAULT 0,
+    error TEXT,
+    started_at REAL,
+    completed_at REAL,
+    backup_path TEXT,
+    last_heartbeat REAL
+);
+CREATE INDEX IF NOT EXISTS idx_rebuild_status_active
+    ON rebuild_status(tier_group, status);
 """
 
 
@@ -182,9 +223,91 @@ DEFAULT_BUSY_TIMEOUT_MS = 10_000
 # Database creation
 # ---------------------------------------------------------------------------
 
+_EXPECTED_COLUMNS = {
+    "recipient": "TEXT DEFAULT ''",
+    "category": "TEXT DEFAULT ''",
+    "modality": "TEXT DEFAULT ''",
+    "episode_id": "INTEGER DEFAULT NULL",
+    "emotional_valence": "REAL DEFAULT 0.0",
+    "embedding_separation": "BLOB DEFAULT NULL",
+}
+
+
+def _backup_database(db_path: Path) -> Path | None:
+    """Create a complete backup of the database including WAL/SHM files.
+
+    Returns the backup path on success, None on failure.
+    """
+    import shutil
+    import uuid
+
+    suffix = f"{int(time.time())}-{uuid.uuid4().hex[:8]}"
+    backup = Path(f"{db_path}.backup-pre-migration-{suffix}")
+
+    if backup.exists():
+        return None
+
+    try:
+        shutil.copy2(str(db_path), str(backup))
+        for ext in ("-wal", "-shm"):
+            wal_path = Path(f"{db_path}{ext}")
+            if wal_path.exists():
+                shutil.copy2(str(wal_path), str(backup) + ext)
+        log.info("Legacy DB backup created: %s", backup)
+        return backup
+    except Exception as e:
+        log.warning("Could not back up database before migration: %s", e)
+        return None
+
+
+def _migrate_messages_schema(conn: sqlite3.Connection, db_path: str | Path) -> None:
+    """Add missing columns to an existing messages table (legacy DB upgrade).
+
+    Safety measures:
+    - Creates a complete backup (DB + WAL + SHM) before any changes
+    - If backup fails, migration is skipped entirely
+    - All ALTER TABLE statements run inside a single transaction
+    - If any ALTER fails, the entire transaction is rolled back
+    - Only runs if the messages table already exists and is missing columns
+    """
+    try:
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(messages)").fetchall()}
+    except Exception:
+        return
+    if not existing:
+        return
+
+    missing = {col: typedef for col, typedef in _EXPECTED_COLUMNS.items() if col not in existing}
+    if not missing:
+        return
+
+    if str(db_path) != ":memory:":
+        backup = _backup_database(Path(str(db_path)))
+        if backup is None:
+            log.warning("Skipping legacy migration — backup failed")
+            return
+
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        for col, typedef in missing.items():
+            conn.execute(f"ALTER TABLE messages ADD COLUMN {col} {typedef}")
+            log.info("Migrated legacy DB: added column messages.%s", col)
+        conn.execute("COMMIT")
+    except Exception as e:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        log.warning("Legacy migration failed and was rolled back: %s", e)
+
+
 def create_db(db_path: str | Path) -> sqlite3.Connection:
     """
     Create (or open) a TrueMemory database with the full schema.
+
+    If the database has an older schema (pre-v0.5), missing columns are
+    added automatically via ALTER TABLE. A timestamped backup is created
+    before any migration.
 
     Enables WAL mode for concurrent read/write performance and executes all
     CREATE TABLE / CREATE VIRTUAL TABLE / CREATE TRIGGER statements.
@@ -203,6 +326,7 @@ def create_db(db_path: str | Path) -> sqlite3.Connection:
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA cache_size=-64000")
     conn.execute("PRAGMA mmap_size=268435456")
+    _migrate_messages_schema(conn, db_path)
     conn.executescript(_SCHEMA_SQL)
     conn.commit()
     return conn
@@ -480,15 +604,21 @@ def delete_message(conn: sqlite3.Connection, msg_id: int) -> bool:
     deleted = cursor.rowcount > 0
 
     if deleted:
-        # Clean up vector embedding (best-effort — table may not exist)
-        try:
-            conn.execute("DELETE FROM vec_messages WHERE rowid = ?", (msg_id,))
-        except sqlite3.OperationalError:
-            pass
-        try:
-            conn.execute("DELETE FROM vec_messages_sep WHERE rowid = ?", (msg_id,))
-        except sqlite3.OperationalError:
-            pass
+        for tbl in (
+            "vec_messages", "vec_messages_edge", "vec_messages_basepro",
+        ):
+            try:
+                conn.execute(f"DELETE FROM {tbl} WHERE rowid = ?", (msg_id,))
+            except sqlite3.OperationalError:
+                pass
+        for tbl in (
+            "vec_messages_sep", "vec_messages_sep_edge",
+            "vec_messages_sep_basepro",
+        ):
+            try:
+                conn.execute(f"DELETE FROM {tbl} WHERE rowid = ?", (msg_id,))
+            except sqlite3.OperationalError:
+                pass
 
     conn.commit()
     return deleted

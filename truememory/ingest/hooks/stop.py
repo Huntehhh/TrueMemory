@@ -110,6 +110,21 @@ def _parse_args() -> argparse.Namespace:
 
 
 def main():
+    if os.environ.get("TRUEMEMORY_EXTRACTION"):
+        try:
+            input_data = json.load(sys.stdin)
+        except (json.JSONDecodeError, EOFError):
+            input_data = {}
+        transcript_path = input_data.get("transcript_path", "")
+        session_id = input_data.get("session_id", "")
+        if transcript_path and session_id:
+            from truememory.ingest.hooks._shared import mark_session_extracted
+            try:
+                mark_session_extracted(session_id, transcript_path)
+            except Exception as exc:
+                log.debug("stop hook: failed to mark extraction session %s: %s", session_id, exc)
+        return
+
     args = _parse_args()
 
     # ── HUNK #1 (PREREQUISITE) ────────────────────────────────────────────────
@@ -158,8 +173,17 @@ def main():
         )
         return
 
-    # Run ingestion in the background so we don't block Claude Code
-    _run_background_ingestion(transcript_path, session_id, args.user, args.db)
+    from truememory.ingest.hooks._shared import should_extract_session, mark_session_extracted
+    if not should_extract_session(session_id, transcript_path):
+        log.info("stop hook: session %s already extracted at this size, skipping", session_id)
+        return
+
+    spawned_pid = _run_background_ingestion(transcript_path, session_id, args.user, args.db)
+
+    try:
+        mark_session_extracted(session_id, transcript_path, spawned_pid=spawned_pid)
+    except Exception:
+        pass
 
     try:
         from truememory.ingest.hooks._injection_log import write_injection
@@ -334,7 +358,7 @@ def _run_background_ingestion(
     session_id: str,
     user_id: str,
     db_path: str,
-):
+) -> int:
     """Launch the ingestion pipeline as a background process.
 
     Captures stderr/stdout to a log file so silent failures are recoverable.
@@ -388,22 +412,33 @@ def _run_background_ingestion(
     else:
         detach_kwargs["start_new_session"] = True
 
+    from truememory.ingest.hooks._shared import check_extraction_budget
+    if not check_extraction_budget():
+        log.warning("stop hook: extraction budget exhausted (20/hr); queueing session %r", session_id)
+        _queue_to_backlog(
+            transcript_path, session_id, user_id, db_path,
+            reason="extraction_budget_exhausted",
+        )
+        return 0
+
     # Use flock-based spawn gate to prevent the TOCTOU race where N hooks
     # all check pgrep simultaneously, all see 0, and all spawn.
-    from truememory.hooks.core import spawn_gate, register_spawned_pid
+    from truememory.hooks.core import spawn_gate, register_spawned_pid, _load_cap_state
+
+    effective_cap = _load_cap_state().get("cap", SPAWN_CAP)
 
     with spawn_gate() as allowed:
         if not allowed:
             log.warning(
                 "stop hook: at spawn cap (cap %d); queueing session "
                 "%r to backlog for later",
-                SPAWN_CAP, session_id,
+                effective_cap, session_id,
             )
             _queue_to_backlog(
                 transcript_path, session_id, user_id, db_path,
-                reason=f"spawn_cap_reached:SPAWN_CAP={SPAWN_CAP}",
+                reason=f"spawn_cap_reached:SPAWN_CAP={effective_cap}",
             )
-            return
+            return 0
 
         log_file = None
         try:
@@ -418,6 +453,7 @@ def _run_background_ingestion(
             )
             log.info("stop hook: spawned pid=%d session=%s cmd=%s", proc.pid, session_id, cmd[0])
             register_spawned_pid(proc.pid)
+            return proc.pid
         except Exception as e:
             log.warning(
                 "stop hook: background launch failed (%s); queueing session "
@@ -428,12 +464,14 @@ def _run_background_ingestion(
                 transcript_path, session_id, user_id, db_path,
                 reason=f"popen_failed:{type(e).__name__}:{e}",
             )
+            return 0
         finally:
             if log_file is not None:
                 try:
                     log_file.close()
                 except Exception:
                     pass
+    return 0
 
 
 if __name__ == "__main__":
