@@ -70,8 +70,14 @@ def _identify_claude_cli_caller() -> str:
 def _log_claude_cli_usage(
     *, model: str, caller: str, prompt_chars: int, response_chars: int,
     duration_ms: int, exit_code: int, error: str = "",
+    auth_failure: bool = False,
 ) -> None:
-    """Append-only JSONL telemetry. NEVER raises — wrapped in broad except."""
+    """Append-only JSONL telemetry. NEVER raises — wrapped in broad except.
+
+    ``auth_failure`` is set when the invocation was classified as a dead-token /
+    OAuth failure (see ``_looks_like_auth_failure``); recording it lets the
+    usage log surface re-auth events alongside the rest of the CLI telemetry.
+    """
     try:
         _CLAUDE_CLI_USAGE_LOG.parent.mkdir(parents=True, exist_ok=True)
         record = {
@@ -86,6 +92,8 @@ def _log_claude_cli_usage(
         }
         if error:
             record["error"] = error[:200]
+        if auth_failure:
+            record["auth_failure"] = True
         with open(_CLAUDE_CLI_USAGE_LOG, "a", encoding="utf-8") as f:
             f.write(json.dumps(record) + "\n")
     except Exception:
