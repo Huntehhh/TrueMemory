@@ -43,6 +43,19 @@ _model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 _lock = threading.Lock()
 _inference_lock = threading.Lock()  # Protects concurrent model.predict() calls
 
+# Set True while a cold load is in flight inside get_reranker(). The idle-unload
+# timer (mcp_server._check_idle_unload -> unload_reranker) checks this and skips
+# the unload so it cannot null a model that is still loading. A cold load can
+# take many seconds (hundreds, on a contended CPU/GPU box); without this guard a
+# concurrently-firing idle timer blocks on _lock until the load finishes, then
+# immediately discards the freshly-loaded model — defeating the entire load.
+# Guarded by its own lightweight lock so unload can check it WITHOUT taking
+# _lock (which get_reranker holds across the whole load -> would serialize and
+# still null the model). A plain bool guarded by a short-lived lock — no risk of
+# deadlock with _lock.
+_loading = False
+_loading_lock = threading.Lock()
+
 # ---------------------------------------------------------------------------
 # Tier-aware reranker resolution (v0.4.0 paper §2.0)
 # ---------------------------------------------------------------------------
@@ -141,8 +154,19 @@ def get_current_reranker_name() -> str:
 
 
 def unload_reranker() -> None:
-    """Release the reranker model from memory."""
+    """Release the reranker model from memory.
+
+    No-op while a cold load is in flight (``_loading`` set by get_reranker).
+    This prevents the idle-unload timer from racing a slow load and discarding
+    the model the instant it finishes. Checked WITHOUT ``_lock`` so we never
+    block on the load (get_reranker holds ``_lock`` for the load's duration);
+    ``_loading_lock`` is short-lived, so there is no deadlock.
+    """
     global _model
+    with _loading_lock:
+        if _loading:
+            log.debug("unload_reranker skipped: cold load in progress")
+            return
     with _lock:
         _model = None
 
@@ -166,7 +190,7 @@ def get_reranker(model_name: str | None = None, device: str | None = None):
     Returns:
         A ``sentence_transformers.CrossEncoder`` instance or RerankerProxy.
     """
-    global _model, _model_name
+    global _model, _model_name, _loading
 
     name = model_name or get_current_reranker_name()
     cached_model, cached_name = _model, _model_name
@@ -177,42 +201,53 @@ def get_reranker(model_name: str | None = None, device: str | None = None):
         if cached_model is not None and name == cached_name:
             return cached_model
 
-        from truememory.model_client import use_model_server, get_reranker_proxy
-        if use_model_server():
-            try:
-                proxy = get_reranker_proxy(model_name=name)
-                _model = proxy
-                _model_name = name
-                return _model
-            except Exception:
-                log.warning(
-                    "Model server available but reranker proxy failed — "
-                    "falling back to local model loading (high memory cost). "
-                    "Check ~/.truememory/model_server.stderr for details."
-                )
+        # Confirmed cache miss -> a cold load is about to happen. Flag it so a
+        # concurrently-firing idle-unload timer skips its unload instead of
+        # nulling the model we are loading. Cleared in finally on success OR
+        # failure. _loading_lock is held only for the flag flip, never across
+        # the load itself.
+        with _loading_lock:
+            _loading = True
+        try:
+            from truememory.model_client import use_model_server, get_reranker_proxy
+            if use_model_server():
+                try:
+                    proxy = get_reranker_proxy(model_name=name)
+                    _model = proxy
+                    _model_name = name
+                    return _model
+                except Exception:
+                    log.warning(
+                        "Model server available but reranker proxy failed — "
+                        "falling back to local model loading (high memory cost). "
+                        "Check ~/.truememory/model_server.stderr for details."
+                    )
 
-        from sentence_transformers import CrossEncoder
+            from sentence_transformers import CrossEncoder
 
-        if device is None:
-            try:
-                import torch
-                if torch.cuda.is_available():
-                    device = "cuda:0"
-                elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-                    device = "mps"
-                else:
+            if device is None:
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        device = "cuda:0"
+                    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                        device = "mps"
+                    else:
+                        device = "cpu"
+                except ImportError:
                     device = "cpu"
-            except ImportError:
-                device = "cpu"
 
-        _t_load = __import__("time").time()
-        _model = CrossEncoder(name, device=device)
-        _model_name = name
-        log.info(
-            "reranker.get_reranker model_loaded model=%s device=%s load_ms=%.0f",
-            name, device, (__import__("time").time() - _t_load) * 1000,
-        )
-        return _model
+            _t_load = __import__("time").time()
+            _model = CrossEncoder(name, device=device)
+            _model_name = name
+            log.info(
+                "reranker.get_reranker model_loaded model=%s device=%s load_ms=%.0f",
+                name, device, (__import__("time").time() - _t_load) * 1000,
+            )
+            return _model
+        finally:
+            with _loading_lock:
+                _loading = False
 
 
 # ---------------------------------------------------------------------------
