@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "truememory"
-version = "0.6.8"
+version = "0.7.1.3"
 description = "SOTA-level agent memory at zero infrastructure cost."
 readme = "README.md"
 license = "AGPL-3.0-only"
@@ -34,6 +34,8 @@ dependencies = [
     "sentence-transformers>=3.0.0,<6.0",
     "torch>=2.0.0,<3.0",
     "anthropic>=0.80.0,<1.0",
+    "psutil>=5.9,<8.0",
+    "setproctitle>=1.3,<2.0",
 ]
 
 [project.optional-dependencies]
@@ -42,12 +44,22 @@ dependencies = [
 reranker = []
 gpu = []
 agentic = []
+dashboard = [
+    "fastapi>=0.100,<1.0",
+    "uvicorn[standard]>=0.20,<1.0",
+    "pywebview>=5.0,<6.0",
+]
 dev = ["pytest>=7.0,<10.0", "ruff>=0.4,<1.0", "build>=1.2,<2.0", "twine>=5.0,<7.0"]
 all = ["truememory[agentic]"]
 
 [project.scripts]
 truememory-mcp = "truememory.mcp_server:main"
 truememory-ingest = "truememory.ingest.cli:main"
+truememory-model-server = "truememory.model_server:main"
+truememory-dashboard = "truememory.dashboard.cli:main"
+
+[tool.setuptools.package-data]
+truememory = ["assets/*.icns"]
 
 [project.urls]
 Homepage = "https://github.com/buildingjoshbetter/TrueMemory"
@@ -100,4 +112,14 @@ exclude = [
     "*.pyc",
     "__pycache__",
     ".DS_Store",
+    "/truememory/dashboard/frontend/node_modules",
+    "/truememory/dashboard/frontend/src",
+    "/truememory/dashboard/frontend/package.json",
+    "/truememory/dashboard/frontend/bun.lock",
+    "/truememory/dashboard/frontend/vite.config.ts",
+    "/truememory/dashboard/frontend/tailwind.config.ts",
+    "/truememory/dashboard/frontend/tsconfig.json",
+    "/truememory/dashboard/frontend/tsconfig.app.json",
+    "/truememory/dashboard/frontend/tsconfig.node.json",
+    "/truememory/dashboard/frontend/postcss.config.js",
 ]

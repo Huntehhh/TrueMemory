@@ -49,33 +49,24 @@ def server(monkeypatch, tmp_path):
 
 
 def test_rebuild_exception_surfaces_in_result(server, monkeypatch):
-    """If build_vectors raises mid re-embed, the payload must include
+    """If the tier-switch rebuild startup fails, the payload must include
     rebuild_error and warning keys — not silently claim success."""
-    # Seed a memory so the re-embed branch actually runs
     m = server._get_memory()
     m.add("seed memory", user_id="alice")
 
-    # Make build_vectors blow up during the tier switch
     import truememory.vector_search as vs
+    monkeypatch.setattr(vs, "set_embedding_model", lambda tier: None)
+
+    import truememory.reranker as rr
+    monkeypatch.setattr(rr, "set_active_tier", lambda tier: None)
+    monkeypatch.setattr(server, "_set_reranker", lambda name: None)
+
+    from truememory.tier_switch import manager as mgr
 
     def _boom(*args, **kwargs):
         raise RuntimeError("simulated disk full")
 
-    monkeypatch.setattr(vs, "build_vectors", _boom)
-
-    # Switch tier (edge → base) which triggers re-embed. Stub
-    # sentence_transformers import so this test works in minimal envs.
-    import builtins
-    real_import = builtins.__import__
-
-    def fake_import(name, *args, **kwargs):
-        if name == "sentence_transformers":
-            # Pretend it imports fine — return a stub module
-            import types
-            return types.ModuleType("sentence_transformers")
-        return real_import(name, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "__import__", fake_import)
+    monkeypatch.setattr(mgr.RebuildManager, "start_rebuild", _boom)
 
     result_json = server.truememory_configure(tier="base")
     result = json.loads(result_json)
@@ -84,58 +75,39 @@ def test_rebuild_exception_surfaces_in_result(server, monkeypatch):
     assert "RuntimeError" in result["rebuild_error"]
     assert "simulated disk full" in result["rebuild_error"]
     assert "warning" in result
-    # And _memory must be nulled regardless of failure
     assert server._memory is None
 
 
 def test_rebuild_clears_memory_singleton_on_success(server, monkeypatch):
-    """On a successful same-dim tier switch, _memory should be None so the
-    next call gets a fresh instance with the new embedder."""
+    """On a cross-group tier switch, _memory should be None so the next
+    call gets a fresh instance with the new embedder, and the async
+    rebuild should be started (returns a status_id)."""
     m = server._get_memory()
     m.add("seed", user_id="alice")
     assert server._memory is not None
 
-    import builtins
-    real_import = builtins.__import__
-
-    def fake_import(name, *args, **kwargs):
-        if name == "sentence_transformers":
-            import types
-            return types.ModuleType("sentence_transformers")
-        return real_import(name, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "__import__", fake_import)
-
-    # Mock the model-switch calls that would require downloading models
     import truememory.vector_search as vs
     import truememory.reranker as rr
     monkeypatch.setattr(vs, "set_embedding_model", lambda tier: None)
     monkeypatch.setattr(rr, "set_active_tier", lambda tier: None)
     monkeypatch.setattr(server, "_set_reranker", lambda name: None)
 
-    # Keep vectors rebuild stubbed to skip the model load, just note it ran
-    calls = {"main": 0, "sep": 0}
+    from truememory.tier_switch import manager as mgr
+    rebuild_calls = {"count": 0}
 
-    def _fake_build_vectors(conn, messages=None):
-        calls["main"] += 1
-        return 1
+    def _fake_start_rebuild(*args, **kwargs):
+        rebuild_calls["count"] += 1
+        return 42  # fake status_id
 
-    def _fake_build_sep(conn, messages=None):
-        calls["sep"] += 1
-        return 1
+    monkeypatch.setattr(mgr.RebuildManager, "start_rebuild", _fake_start_rebuild)
 
-    monkeypatch.setattr(vs, "build_vectors", _fake_build_vectors)
-    monkeypatch.setattr(vs, "build_separation_vectors", _fake_build_sep)
-    monkeypatch.setattr(vs, "init_vec_table", lambda conn: None)
-
-    result_json = server.truememory_configure(tier="pro")
+    result_json = server.truememory_configure(tier="base")
     result = json.loads(result_json)
-    assert result["tier"] == "pro"
-    # The critical F03 behavior: both vec tables rebuilt, not just the main.
-    assert calls["main"] >= 1, "build_vectors was not called"
-    assert calls["sep"] >= 1, "build_separation_vectors was not called — F03 regression"
+    assert result["tier"] == "base"
+    assert rebuild_calls["count"] >= 1, "start_rebuild was not called"
     assert server._memory is None
     assert "rebuild_error" not in result
+    assert result.get("status_id") == 42
 
 
 def test_no_tier_change_skips_rebuild(server):

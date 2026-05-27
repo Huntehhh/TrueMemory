@@ -151,6 +151,9 @@ def get_reranker(model_name: str | None = None, device: str | None = None):
     """
     Lazy-load the cross-encoder reranker (singleton).
 
+    When the shared model server is enabled (default), returns a proxy
+    that routes inference to the server. Falls back to local loading.
+
     Args:
         model_name: HuggingFace model ID.  If None (the default), resolves via
                     ``get_current_reranker_name()`` to the tier-correct model
@@ -161,16 +164,32 @@ def get_reranker(model_name: str | None = None, device: str | None = None):
                     If None, auto-detects.
 
     Returns:
-        A ``sentence_transformers.CrossEncoder`` instance.
+        A ``sentence_transformers.CrossEncoder`` instance or RerankerProxy.
     """
     global _model, _model_name
 
     name = model_name or get_current_reranker_name()
-    if _model is not None and name == _model_name:
-        return _model  # Fast path, no lock needed
+    cached_model, cached_name = _model, _model_name
+    if cached_model is not None and name == cached_name:
+        return cached_model
     with _lock:
-        if _model is not None and name == _model_name:
-            return _model  # Another thread loaded it
+        cached_model, cached_name = _model, _model_name
+        if cached_model is not None and name == cached_name:
+            return cached_model
+
+        from truememory.model_client import use_model_server, get_reranker_proxy
+        if use_model_server():
+            try:
+                proxy = get_reranker_proxy(model_name=name)
+                _model = proxy
+                _model_name = name
+                return _model
+            except Exception:
+                log.warning(
+                    "Model server available but reranker proxy failed — "
+                    "falling back to local model loading (high memory cost). "
+                    "Check ~/.truememory/model_server.stderr for details."
+                )
 
         from sentence_transformers import CrossEncoder
 

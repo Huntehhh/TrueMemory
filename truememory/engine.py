@@ -61,6 +61,17 @@ _ALLOWED_COLUMNS = frozenset({
     "source_message_id", "cause_msg_id", "effect_msg_id",
 })
 
+_SQLITE_IN_CHUNK = 500
+
+
+def _delete_in_chunks(conn, table: str, col: str, ids: list[int], chunk_size: int = _SQLITE_IN_CHUNK) -> None:
+    if not ids:
+        return
+    for i in range(0, len(ids), chunk_size):
+        chunk = ids[i:i + chunk_size]
+        placeholders = ",".join("?" * len(chunk))
+        conn.execute(f"DELETE FROM {table} WHERE {col} IN ({placeholders})", chunk)
+
 # ───────────────────────────────────────────────────────────────────────────
 # Optional modules — each import is wrapped so missing deps don't break
 # the engine.  Capability flags track what's available at runtime.
@@ -74,6 +85,7 @@ try:
         build_separation_vectors,
         TrueMemoryMigrationError,
         _check_rebuild_allowed,
+        resolve_tier,
     )
     _HAS_VECTOR = True
 except (ImportError, ModuleNotFoundError):
@@ -337,6 +349,11 @@ class TrueMemoryEngine:
                     sqlite_vec.load(self.conn)
                     self.conn.enable_load_extension(False)
                     init_vec_table(self.conn)
+                    try:
+                        from truememory.vector_search import migrate_legacy_vec_tables
+                        migrate_legacy_vec_tables(self.conn)
+                    except Exception:
+                        logger.debug("Legacy vec table migration skipped", exc_info=True)
                     self._has_vectors = True
                     _dim_row = self.conn.execute(
                         "SELECT COUNT(*) FROM vec_messages"
@@ -347,8 +364,10 @@ class TrueMemoryEngine:
                         self._has_vectors,
                         _dim_row[0] if _dim_row else 0,
                     )
-                except Exception:
-                    logger.debug("Failed to load sqlite-vec extension", exc_info=True)
+                except Exception as exc:
+                    global _vectors_load_error
+                    _vectors_load_error = f"{type(exc).__name__}: {exc}"
+                    logger.warning("Failed to load sqlite-vec — FTS-only mode: %s", exc)
                     self._has_vectors = False
 
             self._has_hybrid = _HAS_HYBRID and self._has_vectors
@@ -358,7 +377,7 @@ class TrueMemoryEngine:
             import sys as _sys
             if _sys.platform == "darwin" and self._has_vectors:
                 try:
-                    _embed_model = os.environ.get("TRUEMEMORY_EMBED_MODEL", "edge")
+                    _embed_model = resolve_tier()
                     if _embed_model in ("base", "pro", "qwen3_256"):
                         _tables = {r[0] for r in self.conn.execute(
                             "SELECT name FROM sqlite_master WHERE type='table'"
@@ -547,6 +566,8 @@ class TrueMemoryEngine:
         Returns:
             True if any rows were deleted from messages.
         """
+        if user_id is not None and not isinstance(user_id, str):
+            raise TypeError(f"user_id must be a string or None, got {type(user_id).__name__}")
         if isinstance(user_id, str) and not user_id.strip():
             raise ValueError("user_id cannot be an empty string")
 
@@ -572,10 +593,9 @@ class TrueMemoryEngine:
                 )
                 deleted = cursor.rowcount > 0
 
-                # Clean up related tables scoped to this user
+                # Clean up related tables scoped to this user (chunked
+                # to avoid SQLite's 999-variable limit on large datasets)
                 if msg_ids:
-                    placeholders = ",".join("?" * len(msg_ids))
-
                     for table, col in [
                         ("fact_timeline", "source_message_id"),
                         ("landmark_events", "source_message_id"),
@@ -587,10 +607,7 @@ class TrueMemoryEngine:
                         if col not in _ALLOWED_COLUMNS:
                             raise ValueError(f"Invalid column name: {col}")
                         try:
-                            self.conn.execute(
-                                f"DELETE FROM {table} WHERE {col} IN ({placeholders})",
-                                msg_ids,
-                            )
+                            _delete_in_chunks(self.conn, table, col, msg_ids)
                         except Exception:
                             logger.warning("Failed to clean %s for user %s", table, user_id, exc_info=True)
 
@@ -627,14 +644,9 @@ class TrueMemoryEngine:
                 except Exception:
                     logger.warning("Failed to clean summaries for user %s", user_id, exc_info=True)
 
-                # Clean episodes linked to this user's messages
                 if episode_ids:
-                    ep_placeholders = ",".join("?" * len(episode_ids))
                     try:
-                        self.conn.execute(
-                            f"DELETE FROM episodes WHERE id IN ({ep_placeholders})",
-                            episode_ids,
-                        )
+                        _delete_in_chunks(self.conn, "episodes", "id", episode_ids)
                     except Exception:
                         logger.warning("Failed to clean episodes for user %s", user_id, exc_info=True)
 
@@ -644,10 +656,7 @@ class TrueMemoryEngine:
                         if vec_table not in _ALLOWED_TABLES:
                             raise ValueError(f"Invalid table name: {vec_table}")
                         try:
-                            self.conn.execute(
-                                f"DELETE FROM {vec_table} WHERE rowid IN ({placeholders})",
-                                msg_ids,
-                            )
+                            _delete_in_chunks(self.conn, vec_table, "rowid", msg_ids)
                         except Exception:
                             logger.warning("Failed to clean %s for user %s", vec_table, user_id, exc_info=True)
 
@@ -935,7 +944,7 @@ class TrueMemoryEngine:
                 logger.warning(
                     "vec_messages table missing; attempting rebuild with "
                     "current model=%s",
-                    os.environ.get("TRUEMEMORY_EMBED_MODEL", "edge"),
+                    resolve_tier(),
                 )
                 if rebuild_vectors:
                     _check_rebuild_allowed(self.conn)  # raises on model drift
@@ -946,7 +955,7 @@ class TrueMemoryEngine:
                         logger.info(
                             "vec_messages rebuilt with %d vectors (model=%s)",
                             n,
-                            os.environ.get("TRUEMEMORY_EMBED_MODEL", "edge"),
+                            resolve_tier(),
                         )
                     except TrueMemoryMigrationError:
                         raise
@@ -1945,6 +1954,7 @@ class TrueMemoryEngine:
     # IN-clause parameter chunk size. SQLite default is 999 variables —
     # keep a healthy margin for any other bound params in the query.
     _SURPRISE_IN_CHUNK = 500
+    _warned_no_surprise = False
 
     def _source_is_blocked(self, source: str | None) -> bool:
         """True if any '+'-separated segment of `source` is in the
@@ -2059,10 +2069,12 @@ class TrueMemoryEngine:
             # Most likely surprise_scores table doesn't exist yet (cold
             # DB before first consolidate). Surface at WARNING once per
             # process so silent no-ops are visible.
-            logger.warning(
-                "L5 surprise boost unavailable: %s (run consolidate first)",
-                exc,
-            )
+            if not self._warned_no_surprise:
+                logger.warning(
+                    "L5 surprise boost unavailable: %s (run consolidate first)",
+                    exc,
+                )
+                self._warned_no_surprise = True
             return results
         except Exception:
             logger.warning(
@@ -2560,6 +2572,7 @@ Return ONLY the queries, one per line, no numbering or explanation:"""
 
     def get_stats(self) -> dict:
         """Return ingestion and search statistics."""
+        self._ensure_connection()
         stats = dict(self.stats)
 
         # Add live DB stats if connected.
