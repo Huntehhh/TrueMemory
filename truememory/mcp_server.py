@@ -1549,6 +1549,50 @@ def main():
     except ImportError:
         pass
 
+    # Ungraceful-parent-exit hardening (Windows-primary, POSIX-safe).
+    #
+    # When Claude Code dies hard (crash, force-quit, system reboot) the
+    # MCP child can survive as a zombie holding the SQLite read lock on
+    # ~/.truememory/memories.db. Stacking enough zombies triggers 60s
+    # search timeouts. Two complementary mechanisms in truememory._lifecycle:
+    #
+    #   1) sweep_orphan_siblings() — kill any other truememory.mcp_server
+    #      processes whose parent PID is dead before we boot further.
+    #   2) start_parent_watchdog() — daemon thread that exits us hard
+    #      (os._exit) within ~30s of the parent dying.
+    #
+    # Both calls swallow every exception by contract; this try/except is
+    # a belt-and-suspenders guard so server boot continues even if the
+    # module import itself fails for any reason (e.g., stripped wheel).
+    try:
+        from truememory._lifecycle import sweep_orphan_siblings
+        swept = sweep_orphan_siblings()
+        if swept:
+            sys.stderr.write(
+                f"truememory.mcp_server: swept {len(swept)} orphaned "
+                f"sibling(s): {swept}\n"
+            )
+            sys.stderr.flush()
+    except Exception as exc:
+        try:
+            sys.stderr.write(
+                f"truememory.mcp_server: orphan sweep failed "
+                f"({type(exc).__name__}: {exc}); continuing.\n"
+            )
+        except Exception:
+            pass
+    try:
+        from truememory._lifecycle import start_parent_watchdog
+        start_parent_watchdog()
+    except Exception as exc:
+        try:
+            sys.stderr.write(
+                f"truememory.mcp_server: ppid watchdog failed to start "
+                f"({type(exc).__name__}: {exc}); continuing.\n"
+            )
+        except Exception:
+            pass
+
     # HuggingFace offline mode — skip HTTP freshness checks when models are
     # cached. Models are downloaded on first install; subsequent loads
     # should be pure disk reads (~170ms) instead of HTTP round-trips
