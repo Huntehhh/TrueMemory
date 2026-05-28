@@ -3,7 +3,19 @@
 Run as: python -m truememory.model_server
 Or auto-started by model_client on first request.
 
-Listens on ~/.truememory/model.sock (Unix domain socket).
+Transport is platform-branched:
+
+* POSIX (macOS / Linux) — listens on ~/.truememory/model.sock, a Unix
+  domain socket (``AF_UNIX``). Behavior is unchanged from earlier versions.
+* Windows — ``AF_UNIX`` is unavailable, so the server listens on a TCP
+  socket bound to the loopback address ``127.0.0.1`` (never ``0.0.0.0``).
+  It binds to an OS-assigned ephemeral port (``bind`` to port 0) and writes
+  the chosen port to ~/.truememory/model_server.port so the client can find
+  it. Loopback-only means no other host on the network can reach it.
+
+The wire protocol is identical on both transports: a 4-byte big-endian
+length prefix followed by a pickled payload.
+
 Auto-exits after idle timeout (default 300s, configurable via
 TRUEMEMORY_MODEL_SERVER_IDLE env var).
 """
@@ -42,6 +54,7 @@ import pickle  # noqa: E402
 import signal  # noqa: E402
 import socket  # noqa: E402
 import struct  # noqa: E402
+import subprocess  # noqa: E402
 import sys  # noqa: E402
 import threading  # noqa: E402
 import time  # noqa: E402
@@ -54,14 +67,40 @@ log = logging.getLogger(__name__)
 _TRUEMEMORY_DIR = Path.home() / ".truememory"
 SOCK_PATH = _TRUEMEMORY_DIR / "model.sock"
 PID_PATH = _TRUEMEMORY_DIR / "model_server.pid"
+# Windows-only: the chosen loopback TCP port is written here so the client
+# can discover it. Unused on POSIX (which addresses the AF_UNIX socket path).
+PORT_PATH = _TRUEMEMORY_DIR / "model_server.port"
 IDLE_TIMEOUT = int(os.environ.get("TRUEMEMORY_MODEL_SERVER_IDLE", "300"))
+
+# Single source of truth for the transport family. AF_UNIX is absent on
+# Windows Python; the sys.platform guard is belt-and-suspenders in case a
+# future Python on Windows ever exposes a partial AF_UNIX symbol.
+_USE_UNIX = hasattr(socket, "AF_UNIX") and sys.platform != "win32"
+_LOOPBACK_HOST = "127.0.0.1"
 
 _HEADER_FMT = ">I"
 _HEADER_SIZE = struct.calcsize(_HEADER_FMT)
 
 
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write ``text`` to ``path`` atomically via a temp file + os.replace.
+
+    Prevents a client from reading a half-written port file on Windows
+    (no rename-into-place guarantee otherwise on a slow disk).
+    """
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text)
+    os.replace(tmp, path)
+
+
 class ModelServer:
-    """Serves embedding and reranking over a Unix domain socket."""
+    """Serves embedding and reranking.
+
+    Transport is platform-branched: a Unix domain socket on POSIX, a
+    loopback TCP socket (127.0.0.1) on Windows. The chosen Windows port is
+    captured in ``self._port`` after :meth:`run` binds, and persisted to
+    ``PORT_PATH`` for the client to discover.
+    """
 
     _SUSTAINED_THRESHOLD = 10
     _SUSTAINED_WINDOW = 30
@@ -77,6 +116,9 @@ class ModelServer:
         self._embed_timestamps: list[float] = []
         self._throttler = None
         self._throttler_active = False
+        # Loopback TCP port the server is bound to (Windows only). None until
+        # run() binds; stays None on POSIX where the AF_UNIX path is used.
+        self._port: int | None = None
 
     def _get_embed_model(self, tier: str):
         if self._embed_model is not None and self._embed_tier == tier:
@@ -277,9 +319,15 @@ class ModelServer:
                     "Idle timeout (%.0fs), shutting down model server", elapsed
                 )
                 self._running = False
+                # Nudge the blocking accept() awake by self-connecting on the
+                # same transport the listener is bound to.
                 try:
-                    dummy = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                    dummy.connect(str(SOCK_PATH))
+                    if _USE_UNIX:
+                        dummy = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                        dummy.connect(str(SOCK_PATH))
+                    else:
+                        dummy = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        dummy.connect((_LOOPBACK_HOST, self._port))
                     dummy.close()
                 except Exception:
                     pass
@@ -288,13 +336,28 @@ class ModelServer:
     def run(self):
         _TRUEMEMORY_DIR.mkdir(parents=True, exist_ok=True)
 
-        if SOCK_PATH.exists():
-            SOCK_PATH.unlink()
+        if _USE_UNIX:
+            if SOCK_PATH.exists():
+                SOCK_PATH.unlink()
+            srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            srv.bind(str(SOCK_PATH))
+            endpoint = str(SOCK_PATH)
+        else:
+            # Windows: loopback TCP. Bind to port 0 so the OS hands us a free
+            # ephemeral port, then publish the chosen port for the client.
+            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            srv.bind((_LOOPBACK_HOST, 0))
+            self._port = srv.getsockname()[1]
+            # Write the port BEFORE listen()/PID so a client that sees the PID
+            # is guaranteed to also see a readable port file.
+            _atomic_write_text(PORT_PATH, str(self._port))
+            endpoint = f"{_LOOPBACK_HOST}:{self._port}"
 
+        # PID is written last so _server_is_alive()-style probes that key off
+        # the PID only succeed once the listener address is fully published.
         PID_PATH.write_text(str(os.getpid()))
 
-        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        srv.bind(str(SOCK_PATH))
         srv.listen(16)
         srv.settimeout(2.0)
 
@@ -302,8 +365,8 @@ class ModelServer:
         idle_thread.start()
 
         log.info(
-            "Model server started: pid=%d sock=%s idle_timeout=%ds",
-            os.getpid(), SOCK_PATH, IDLE_TIMEOUT,
+            "Model server started: pid=%d endpoint=%s idle_timeout=%ds",
+            os.getpid(), endpoint, IDLE_TIMEOUT,
         )
 
         try:
@@ -326,6 +389,8 @@ class ModelServer:
     def _cleanup(self):
         if SOCK_PATH.exists():
             SOCK_PATH.unlink(missing_ok=True)
+        if PORT_PATH.exists():
+            PORT_PATH.unlink(missing_ok=True)
         if PID_PATH.exists():
             PID_PATH.unlink(missing_ok=True)
         self._embed_model = None
@@ -337,6 +402,41 @@ class ModelServer:
 def _handle_signal(signum, frame):
     log.info("Received signal %d, shutting down", signum)
     sys.exit(0)
+
+
+def _pid_is_alive(pid: int) -> bool:
+    """Cross-platform 'is this PID running?' check.
+
+    POSIX uses the classic ``os.kill(pid, 0)`` probe. Windows has no
+    signal-0 semantics (``os.kill`` there only delivers CTRL events or
+    terminates), so we probe via psutil when available, falling back to a
+    ``tasklist`` query. On any uncertainty we report False so a stale file
+    never blocks a restart.
+    """
+    if sys.platform == "win32":
+        if psutil is not None:
+            return psutil.pid_exists(pid)
+        try:
+            out = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                capture_output=True, text=True, timeout=5,
+            )
+            return str(pid) in out.stdout
+        except Exception:
+            return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, OSError):
+        return False
+
+
+def _remove_stale_endpoint_files() -> None:
+    """Drop sock/port artifacts left by a crashed or killed server."""
+    if SOCK_PATH.exists():
+        SOCK_PATH.unlink(missing_ok=True)
+    if PORT_PATH.exists():
+        PORT_PATH.unlink(missing_ok=True)
 
 
 def main():
@@ -359,13 +459,21 @@ def main():
     if PID_PATH.exists():
         try:
             old_pid = int(PID_PATH.read_text().strip())
-            os.kill(old_pid, 0)
-            log.error("Model server already running (pid=%d)", old_pid)
-            sys.exit(1)
-        except (ProcessLookupError, ValueError):
+        except ValueError:
             PID_PATH.unlink(missing_ok=True)
-            if SOCK_PATH.exists():
-                SOCK_PATH.unlink(missing_ok=True)
+            _remove_stale_endpoint_files()
+        else:
+            if _pid_is_alive(old_pid):
+                log.error("Model server already running (pid=%d)", old_pid)
+                sys.exit(1)
+            PID_PATH.unlink(missing_ok=True)
+            _remove_stale_endpoint_files()
+
+    # Belt-and-suspenders: even if the accept loop's finally is skipped
+    # (e.g. an abrupt interpreter teardown), drop our endpoint files so the
+    # next start isn't blocked by a stale PID/port.
+    import atexit
+    atexit.register(_remove_stale_endpoint_files)
 
     server = ModelServer()
     server.run()
