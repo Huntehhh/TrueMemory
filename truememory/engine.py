@@ -881,10 +881,15 @@ class TrueMemoryEngine:
         # Check for vector tables — rebuild if missing.
         # if metadata names a different embedder, refuse silent
         # rebuild; route the user through truememory_configure() instead.
+        # The active table is tier-specific (vec_messages_edge / _basepro);
+        # probing the flat name produced a spurious "no such table:
+        # vec_messages" surfaced as ``health.vectors = degraded``.
         self._has_vectors = False
         if _HAS_VECTOR:
             try:
-                self.conn.execute("SELECT COUNT(*) FROM vec_messages").fetchone()
+                from truememory.vector_search import _active_vec_table
+                _vec_tbl = _active_vec_table(self.conn)
+                self.conn.execute(f"SELECT COUNT(*) FROM {_vec_tbl}").fetchone()
                 self._has_vectors = True
             except Exception:
                 logger.warning(
