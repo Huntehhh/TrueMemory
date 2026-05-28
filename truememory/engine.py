@@ -355,8 +355,10 @@ class TrueMemoryEngine:
                     except Exception:
                         logger.debug("Legacy vec table migration skipped", exc_info=True)
                     self._has_vectors = True
+                    from truememory.vector_search import _active_vec_table
+                    _vec_tbl = _active_vec_table(self.conn)
                     _dim_row = self.conn.execute(
-                        "SELECT COUNT(*) FROM vec_messages"
+                        f"SELECT COUNT(*) FROM {_vec_tbl}"
                     ).fetchone()
                     logger.debug(
                         "engine.init sqlite_vec_loaded model=%s has_vectors=%s vec_rows=%d",
@@ -938,7 +940,9 @@ class TrueMemoryEngine:
         self._has_vectors = False
         if _HAS_VECTOR:
             try:
-                self.conn.execute("SELECT COUNT(*) FROM vec_messages").fetchone()
+                from truememory.vector_search import _active_vec_table
+                _vec_tbl = _active_vec_table(self.conn)
+                self.conn.execute(f"SELECT COUNT(*) FROM {_vec_tbl}").fetchone()
                 self._has_vectors = True
             except Exception:
                 logger.warning(
