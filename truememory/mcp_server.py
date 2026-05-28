@@ -1957,6 +1957,19 @@ def main():
     )
     _dlog(f"mcp_client_connect pid={os.getpid()} argv0={sys.argv[0]!r} client_hint={client_hint!r}")
 
+    # Opt-in SQLite telemetry instrumentation (default OFF). A no-op unless
+    # TRUEMEMORY_INSTRUMENTATION=1. It monkey-patches the engine at runtime to
+    # emit per-memory salience / retrieval / gate signals into a `telemetry`
+    # table — see truememory.instrumentation. Installed here (before
+    # _preload_models below and before any tool fires) so the preload-lifecycle
+    # patches are in place. Fully isolated: any failure leaves the server
+    # running exactly as if instrumentation were disabled.
+    try:
+        from truememory.instrumentation import install as _install_instrumentation
+        _install_instrumentation()
+    except Exception:
+        pass
+
     # Start shared model server (loads models once for all processes).
     # Falls back to per-process preloading if the server can't start. The
     # per-process path loads models in background threads (~2.5s) while the
