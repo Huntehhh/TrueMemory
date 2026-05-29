@@ -55,6 +55,10 @@ _ALLOWED_TABLES = frozenset({
     "summaries", "episodes", "landmark_events", "causal_edges",
     "surprise_scores", "message_clusters", "cluster_centroids",
     "messages_fts",
+    # Tier-group vector tables (resolved via _active_vec_table /
+    # _active_sep_table); the flat names above are the pre-tier-cache fallback.
+    "vec_messages_edge", "vec_messages_sep_edge",
+    "vec_messages_basepro", "vec_messages_sep_basepro",
 })
 
 _ALLOWED_COLUMNS = frozenset({
@@ -62,6 +66,24 @@ _ALLOWED_COLUMNS = frozenset({
 })
 
 _SQLITE_IN_CHUNK = 500
+
+
+def _resolve_vec_tables(conn) -> tuple[str, str]:
+    """Resolve the active tier's ``(vec, sep)`` table names for delete/update.
+
+    On tier-group-cache DBs the live tables are ``vec_messages_basepro`` /
+    ``vec_messages_edge`` (etc.); the flat ``vec_messages`` name does not
+    exist, so hardcoding it left vectors orphaned on delete/forget/update.
+    Resolves via the same helpers the search path uses (which fall back to
+    the flat names on legacy DBs), validating each name against
+    ``_ALLOWED_TABLES`` before any f-string interpolation.
+    """
+    from truememory.vector_search import _active_vec_table, _active_sep_table
+    vec, sep = _active_vec_table(conn), _active_sep_table(conn)
+    for name in (vec, sep):
+        if name not in _ALLOWED_TABLES:
+            raise ValueError(f"Invalid resolved vector table name: {name!r}")
+    return vec, sep
 
 
 def _delete_in_chunks(conn, table: str, col: str, ids: list[int], chunk_size: int = _SQLITE_IN_CHUNK) -> None:
@@ -598,9 +620,7 @@ class TrueMemoryEngine:
 
                 # Clean vector tables for deleted message IDs
                 if msg_ids:
-                    for vec_table in ("vec_messages", "vec_messages_sep"):
-                        if vec_table not in _ALLOWED_TABLES:
-                            raise ValueError(f"Invalid table name: {vec_table}")
+                    for vec_table in _resolve_vec_tables(self.conn):
                         try:
                             _delete_in_chunks(self.conn, vec_table, "rowid", msg_ids)
                         except Exception:
@@ -629,9 +649,7 @@ class TrueMemoryEngine:
                         logger.warning("Failed to clear table %s during delete_all", table, exc_info=True)
 
                 # Clear vector tables
-                for vec_table in ("vec_messages", "vec_messages_sep"):
-                    if vec_table not in _ALLOWED_TABLES:
-                        raise ValueError(f"Invalid table name: {vec_table}")
+                for vec_table in _resolve_vec_tables(self.conn):
                     try:
                         self.conn.execute(f"DELETE FROM {vec_table}")
                     except Exception:
@@ -674,12 +692,13 @@ class TrueMemoryEngine:
                 try:
                     from truememory.vector_search import embed_single
                     # Remove old embeddings from both vector tables, insert new
+                    _vec_tbl, _sep_tbl = _resolve_vec_tables(self.conn)
                     try:
-                        self.conn.execute("DELETE FROM vec_messages WHERE rowid = ?", (memory_id,))
+                        self.conn.execute(f"DELETE FROM {_vec_tbl} WHERE rowid = ?", (memory_id,))
                     except Exception:
                         logger.debug("Failed to delete old vector embedding for message %d", memory_id, exc_info=True)
                     try:
-                        self.conn.execute("DELETE FROM vec_messages_sep WHERE rowid = ?", (memory_id,))
+                        self.conn.execute(f"DELETE FROM {_sep_tbl} WHERE rowid = ?", (memory_id,))
                     except Exception:
                         logger.debug("Failed to delete old sep vector for message %d", memory_id, exc_info=True)
                     embed_single(self.conn, memory_id, content)
